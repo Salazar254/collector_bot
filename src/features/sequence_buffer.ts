@@ -1,6 +1,6 @@
 import type { TokenLaunchEvent } from "../token_risk_scorer.ts";
 
-export const SEQUENCE_LENGTH = 24;
+export const SEQUENCE_LENGTH = 16;
 export const TEMPORAL_EMBEDDING_DIM = 16;
 export const SEQUENCE_FEATURES = [
   "holder_count",
