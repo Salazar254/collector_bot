@@ -125,6 +125,16 @@ export class OnnxRugScorer {
     const sequenceWidth = this.sequenceWidth();
     const sequence = normalizeLegacySequence(input.sequence, sequenceWidth);
     baseFeeds.sequence = new this.ort.Tensor("float32", Float32Array.from(sequence.flat()), [1, SEQUENCE_LENGTH, sequenceWidth]);
+    
+    // Validate sequence tensor shape to catch training/inference misalignment
+    const [batchSize, seqLen, features] = baseFeeds.sequence.dims as number[];
+    if (batchSize !== 1 || seqLen !== SEQUENCE_LENGTH || features !== sequenceWidth) {
+      throw new Error(
+        `sequence tensor shape mismatch: expected [1,${SEQUENCE_LENGTH},${sequenceWidth}] got [${batchSize},${seqLen},${features}]. ` +
+        "Check SEQUENCE_LENGTH alignment between training and inference."
+      );
+    }
+    
     return baseFeeds;
   }
 
