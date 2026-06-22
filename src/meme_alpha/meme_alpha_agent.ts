@@ -1,4 +1,5 @@
 import type { MemeAlphaConfig } from "../config.ts";
+import type { LpProtectionConfig } from "../lp_protection_gate.ts";
 import type { TokenLaunchEvent } from "../token_risk_scorer.ts";
 import type { Logger } from "../utils/logger.ts";
 import { AntiRugGuard, type AntiRugAuditResult } from "./anti_rug_guard.ts";
@@ -25,10 +26,10 @@ export class MemeAlphaAgent {
   liquidity: LiquiditySpikeDetector;
   sentiment: SocialSentimentBook;
 
-  constructor(config: MemeAlphaConfig, logger: Logger) {
+  constructor(config: MemeAlphaConfig, logger: Logger, lpProtection: LpProtectionConfig) {
     this.config = config;
     this.logger = logger.child({ component: "meme_alpha_agent" });
-    this.antiRug = new AntiRugGuard(config);
+    this.antiRug = new AntiRugGuard(config, lpProtection);
     this.liquidity = new LiquiditySpikeDetector(config);
     this.sentiment = new SocialSentimentBook({
       halfLifeMs: config.sentimentHalfLifeMs,
@@ -100,7 +101,7 @@ export class MemeAlphaAgent {
   }
 
   alphaScore(liquidity: LiquiditySpikeSignal, sentiment: SentimentSummary, audit: AntiRugAuditResult): number {
-    const social = sentiment.samples > 0 ? sentiment.sentimentScore : 0.42;
+    const social = sentiment.samples > 0 ? sentiment.sentimentScore : 0;
     const whale = sentiment.samples > 0 ? sentiment.whaleAccumulationScore : 0;
     const retailPenalty = clamp01(sentiment.retailFomoScore - sentiment.whaleAccumulationScore) * 0.12;
     const spamPenalty = sentiment.botSpamScore * 0.18;

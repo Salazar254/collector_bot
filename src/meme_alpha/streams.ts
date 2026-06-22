@@ -122,6 +122,10 @@ export class MemeAlphaStreamHub {
     }
     const launch = normalizeLaunch(parsed, name);
     if (launch) {
+      if (launch.dataQuality === "incomplete") {
+        this.logger.warn({ stream: name, mint: launch.mint, dataQuality: launch.dataQuality }, "launch_event_rejected_incomplete_data");
+        return;
+      }
       await this.handlers.onLaunch(launch);
       return;
     }
@@ -150,6 +154,41 @@ const normalizeSocial = (payload: Record<string, unknown>): SocialPost | undefin
     authorVerified: boolValue(payload.authorVerified ?? payload.verified)
   };
 };
+const detectMissingSafetyFields = (payload: Record<string, unknown>): string[] => {
+  const incompleteFields: string[] = [];
+  const raw = (key: string, fallback: string): unknown => payload[key] ?? payload[fallback];
+  if (numberValue(raw("lpBurnPct", "lp_burn_pct")) === undefined) incompleteFields.push("lpBurnPct");
+  if (numberValue(raw("rugPullRisk", "rug_pull_risk")) === undefined) incompleteFields.push("rugPullRisk");
+  if (numberValue(raw("honeypotRisk", "honeypot_risk")) === undefined) incompleteFields.push("honeypotRisk");
+  if (numberValue(raw("transferTaxPct", "transfer_tax_pct")) === undefined) incompleteFields.push("transferTaxPct");
+  if (numberValue(raw("topHolderPct", "top_holder_pct")) === undefined) incompleteFields.push("topHolderPct");
+  if (numberValue(raw("top10HolderPct", "top10_holder_pct")) === undefined) incompleteFields.push("top10HolderPct");
+  if (numberValue(raw("devHoldPct", "dev_hold_pct")) === undefined) incompleteFields.push("devHoldPct");
+  if (boolValue(raw("mintAuthorityRenounced", "mint_authority_renounced")) === undefined) incompleteFields.push("mintAuthorityRenounced");
+  if (boolValue(raw("freezeAuthorityRenounced", "freeze_authority_renounced")) === undefined) incompleteFields.push("freezeAuthorityRenounced");
+  return incompleteFields;
+};
+
+const validateLaunchEvent = (event: TokenLaunchEvent, missingFields: string[]): TokenLaunchEvent => {
+  if (missingFields.length === 0) {
+    return { ...event, dataQuality: "complete" };
+  }
+  const patched = { ...event, dataQuality: "incomplete" as const };
+  for (const field of missingFields) {
+    switch (field) {
+      case "lpBurnPct": patched.lpBurnPct = 0; break;
+      case "rugPullRisk": patched.rugPullRisk = 1; break;
+      case "honeypotRisk": patched.honeypotRisk = 1; break;
+      case "transferTaxPct": patched.transferTaxPct = 1; break;
+      case "topHolderPct": patched.topHolderPct = 1; break;
+      case "top10HolderPct": patched.top10HolderPct = 1; break;
+      case "devHoldPct": patched.devHoldPct = 1; break;
+      case "mintAuthorityRenounced": patched.mintAuthorityRenounced = false; break;
+      case "freezeAuthorityRenounced": patched.freezeAuthorityRenounced = false; break;
+    }
+  }
+  return patched;
+};
 
 const normalizeLaunch = (payload: Record<string, unknown>, streamName: string): TokenLaunchEvent | undefined => {
   const mint = stringValue(payload.mint ?? payload.contractAddress ?? payload.contract_address);
@@ -157,7 +196,8 @@ const normalizeLaunch = (payload: Record<string, unknown>, streamName: string): 
   if (!mint || liquiditySol === undefined) {
     return undefined;
   }
-  return {
+  const missingFields = detectMissingSafetyFields(payload);
+  const event: TokenLaunchEvent = {
     mint,
     deployer: stringValue(payload.deployer) || "unknown",
     timestamp: numberValue(payload.timestamp) || Date.now(),
@@ -168,21 +208,21 @@ const normalizeLaunch = (payload: Record<string, unknown>, streamName: string): 
     liquiditySol,
     previousLiquiditySol: numberValue(payload.previousLiquiditySol ?? payload.previous_liquidity_sol),
     liquiditySpikePct: numberValue(payload.liquiditySpikePct ?? payload.liquidity_spike_pct),
-    lpBurnPct: numberValue(payload.lpBurnPct ?? payload.lp_burn_pct) ?? 1,
+    lpBurnPct: numberValue(payload.lpBurnPct ?? payload.lp_burn_pct) ?? 0,
     ageSeconds: numberValue(payload.ageSeconds ?? payload.age_seconds) ?? 0,
     uniqueBuyers: numberValue(payload.uniqueBuyers ?? payload.unique_buyers) ?? 0,
     totalVolumeSol: numberValue(payload.totalVolumeSol ?? payload.total_volume_sol) ?? liquiditySol,
     previousVolumeSol: numberValue(payload.previousVolumeSol ?? payload.previous_volume_sol),
     marketCapSol: numberValue(payload.marketCapSol ?? payload.market_cap_sol) ?? liquiditySol * 12,
-    rugPullRisk: numberValue(payload.rugPullRisk ?? payload.rug_pull_risk) ?? 0,
-    honeypotRisk: numberValue(payload.honeypotRisk ?? payload.honeypot_risk) ?? 0,
-    transferTaxPct: numberValue(payload.transferTaxPct ?? payload.transfer_tax_pct) ?? 0,
-    topHolderPct: numberValue(payload.topHolderPct ?? payload.top_holder_pct) ?? 0,
-    top10HolderPct: numberValue(payload.top10HolderPct ?? payload.top10_holder_pct),
-    devHoldPct: numberValue(payload.devHoldPct ?? payload.dev_hold_pct) ?? 0,
+    rugPullRisk: numberValue(payload.rugPullRisk ?? payload.rug_pull_risk) ?? 1,
+    honeypotRisk: numberValue(payload.honeypotRisk ?? payload.honeypot_risk) ?? 1,
+    transferTaxPct: numberValue(payload.transferTaxPct ?? payload.transfer_tax_pct) ?? 1,
+    topHolderPct: numberValue(payload.topHolderPct ?? payload.top_holder_pct) ?? 1,
+    top10HolderPct: numberValue(payload.top10HolderPct ?? payload.top10_holder_pct) ?? 1,
+    devHoldPct: numberValue(payload.devHoldPct ?? payload.dev_hold_pct) ?? 1,
     mutableMetadata: boolValue(payload.mutableMetadata ?? payload.mutable_metadata) ?? false,
-    mintAuthorityRenounced: boolValue(payload.mintAuthorityRenounced ?? payload.mint_authority_renounced) ?? true,
-    freezeAuthorityRenounced: boolValue(payload.freezeAuthorityRenounced ?? payload.freeze_authority_renounced) ?? true,
+    mintAuthorityRenounced: boolValue(payload.mintAuthorityRenounced ?? payload.mint_authority_renounced) ?? false,
+    freezeAuthorityRenounced: boolValue(payload.freezeAuthorityRenounced ?? payload.freeze_authority_renounced) ?? false,
     ownerRenounced: boolValue(payload.ownerRenounced ?? payload.owner_renounced),
     proxyContract: boolValue(payload.proxyContract ?? payload.proxy_contract),
     blacklistFunction: boolValue(payload.blacklistFunction ?? payload.blacklist_function),
@@ -192,10 +232,11 @@ const normalizeLaunch = (payload: Record<string, unknown>, streamName: string): 
     buySellRatio: numberValue(payload.buySellRatio ?? payload.buy_sell_ratio) ?? 1,
     jitoCompetition: numberValue(payload.jitoCompetition ?? payload.jito_competition) ?? 0.5,
     launchRatePerMinute: numberValue(payload.launchRatePerMinute ?? payload.launch_rate_per_minute) ?? 0,
-    predictedWinProb: numberValue(payload.predictedWinProb ?? payload.predicted_win_prob) ?? 0.5,
-    rewardRiskRatio: numberValue(payload.rewardRiskRatio ?? payload.reward_risk_ratio) ?? 1,
+    predictedWinProb: numberValue(payload.predictedWinProb ?? payload.predicted_win_prob) ?? 0,
+    rewardRiskRatio: numberValue(payload.rewardRiskRatio ?? payload.reward_risk_ratio) ?? 0.1,
     launchPlatform: stringValue(payload.launchPlatform ?? payload.launch_platform ?? streamName)
   };
+  return validateLaunchEvent(event, missingFields);
 };
 
 const extractEmbeddedJson = (payload: Record<string, unknown>): Record<string, unknown> | undefined => {

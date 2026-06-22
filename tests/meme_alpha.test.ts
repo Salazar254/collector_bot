@@ -4,6 +4,7 @@ import { pathToFileURL } from "node:url";
 import { loadConfig } from "../src/config.ts";
 import { AntiRugGuard } from "../src/meme_alpha/anti_rug_guard.ts";
 import { MemeAlphaAgent } from "../src/meme_alpha/meme_alpha_agent.ts";
+import { lpProtectionConfigFromScorer } from "../src/lp_protection_gate.ts";
 import { DegenspeakSentimentEngine } from "../src/meme_alpha/sentiment_engine.ts";
 import { RiskManager, type RiskSignal } from "../src/risk_manager.ts";
 import type { TokenLaunchEvent } from "../src/token_risk_scorer.ts";
@@ -84,13 +85,14 @@ export const runMemeAlphaTests = async (): Promise<void> => {
   assert.ok(whale.whaleAccumulationScore > retail.whaleAccumulationScore);
   assert.ok(retail.retailFomoScore > whale.retailFomoScore);
 
-  const guard = new AntiRugGuard(baseConfig().memeAlpha);
+  const lpProtection = lpProtectionConfigFromScorer(baseConfig().scorer);
+  const guard = new AntiRugGuard(baseConfig().memeAlpha, lpProtection);
   const rugAudit = guard.audit(launch({ mintAuthorityRenounced: false, topHolderPct: 0.42 }));
   assert.equal(rugAudit.accepted, false);
   assert.ok(rugAudit.reasons.includes("mint_authority_active"));
   assert.ok(rugAudit.reasons.includes("top_holder_concentration"));
 
-  const agent = new MemeAlphaAgent(baseConfig().memeAlpha, createLogger("error"));
+  const agent = new MemeAlphaAgent(baseConfig().memeAlpha, createLogger("error"), lpProtection);
   agent.ingestSocialPost({
     source: "x",
     mint: "alpha_mint",

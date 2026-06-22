@@ -4,7 +4,9 @@ import type { Logger } from "./logger.ts";
 export interface BundleResult {
   bundleId: string;
   accepted: boolean;
+  landed?: boolean;
   tipSol: number;
+  reason?: string;
 }
 
 interface JitoRpcResponse<T> {
@@ -24,6 +26,58 @@ interface TipFloorEntry {
   ema_landed_tips_50th_percentile?: number;
 }
 
+interface BundleStatusEntry {
+  bundle_id?: string;
+  status?: string;
+  confirmation_status?: string;
+  landed_slot?: number;
+  slot?: number;
+  err?: unknown;
+}
+
+interface BundleStatusesResult {
+  value?: BundleStatusEntry[];
+}
+
+interface InflightBundleStatusEntry {
+  bundle_id?: string;
+  status?: string;
+  landed_slot?: number;
+  err?: unknown;
+}
+
+interface InflightBundleStatusesResult {
+  value?: InflightBundleStatusEntry[];
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+const isLandedStatus = (entry?: BundleStatusEntry | InflightBundleStatusEntry): boolean => {
+  if (!entry) {
+    return false;
+  }
+  const status = String(entry.status || "").toLowerCase();
+  if (status === "landed" || status === "confirmed") {
+    return true;
+  }
+  const confirmation = String((entry as BundleStatusEntry).confirmation_status || "").toLowerCase();
+  if (confirmation === "confirmed" || confirmation === "finalized") {
+    return true;
+  }
+  return typeof entry.landed_slot === "number" || typeof (entry as BundleStatusEntry).slot === "number";
+};
+
+const isFailedStatus = (entry?: BundleStatusEntry | InflightBundleStatusEntry): boolean => {
+  if (!entry) {
+    return false;
+  }
+  if (entry.err) {
+    return true;
+  }
+  const status = String(entry.status || "").toLowerCase();
+  return status === "failed" || status === "invalid";
+};
+
 export class JitoClient {
   config: JitoConfig;
   logger: Logger;
@@ -40,16 +94,61 @@ export class JitoClient {
       throw new Error("jito_bundle_requires_1_to_5_transactions");
     }
     const tipSol = await this.adaptiveTipSol(competition);
-    const response = await this.rpc<string>("/api/v1/bundles", "sendBundle", [
+    const bundleId = await this.rpc<string>("/api/v1/bundles", "sendBundle", [
       transactionsBase64,
       { encoding: "base64" }
     ]);
-    this.logger.info({ bundleId: response, txCount: transactionsBase64.length, tipSol }, "jito_bundle_submitted");
-    return {
-      bundleId: response,
-      accepted: true,
-      tipSol
-    };
+    this.logger.info({ bundleId, txCount: transactionsBase64.length, tipSol }, "jito_bundle_submitted");
+    return this.pollBundleLanding(bundleId, tipSol);
+  }
+
+  async pollBundleLanding(bundleId: string, tipSol: number): Promise<BundleResult> {
+    const attempts = Math.max(1, this.config.maxLandingPollAttempts);
+    const intervalMs = Math.max(50, this.config.landingPollIntervalMs);
+
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (attempt > 0) {
+        await sleep(intervalMs);
+      }
+
+      const landed = await this.fetchLandedBundle(bundleId);
+      if (landed) {
+        this.logger.info({ bundleId, attempt: attempt + 1 }, "jito_bundle_landed");
+        return { bundleId, accepted: true, landed: true, tipSol };
+      }
+
+      const inflight = await this.fetchInflightBundle(bundleId);
+      if (isFailedStatus(inflight)) {
+        this.logger.warn({ bundleId, status: inflight?.status, err: inflight?.err }, "jito_bundle_not_landed");
+        return { bundleId, accepted: false, landed: false, tipSol, reason: "bundle_not_landed" };
+      }
+    }
+
+    this.logger.warn({ bundleId, attempts }, "jito_bundle_status_timeout");
+    return { bundleId, accepted: false, landed: false, tipSol, reason: "bundle_status_timeout" };
+  }
+
+  private async fetchLandedBundle(bundleId: string): Promise<boolean> {
+    try {
+      const result = await this.rpc<BundleStatusesResult>("/api/v1/bundles", "getBundleStatuses", [[bundleId]]);
+      const entry = result.value?.[0];
+      return isLandedStatus(entry);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.debug({ bundleId, error: message }, "jito_get_bundle_statuses_failed");
+      return false;
+    }
+  }
+
+  private async fetchInflightBundle(bundleId: string): Promise<InflightBundleStatusEntry | undefined> {
+    try {
+      const result = await this.rpc<InflightBundleStatusesResult>("/api/v1/bundles", "getInflightBundleStatuses", [[bundleId]]);
+      return result.value?.[0];
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.debug({ bundleId, error: message }, "jito_get_inflight_bundle_statuses_failed");
+      return undefined;
+    }
   }
 
   async getTipAccounts(): Promise<string[]> {

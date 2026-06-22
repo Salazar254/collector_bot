@@ -1,0 +1,40 @@
+{
+  "target_key": "pnl_10m",
+  "target_mode": "regression",
+  "binary_threshold": 0.1,
+  "feature_names": [
+    "liquidity_sol",
+    "liquidity_usd",
+    "unique_buyers",
+    "total_volume",
+    "market_cap_sol",
+    "time_since_launch",
+    "slippage_estimate",
+    "price_growth_1s",
+    "social_proxy_1s",
+    "lp_growth_1s",
+    "buyers_per_sol",
+    "volume_to_lp_ratio",
+    "log_liquidity",
+    "log_volume",
+    "log_mcap",
+    "hour_of_day",
+    "day_of_week",
+    "is_weekend"
+  ],
+  "weights": {
+    "nn": 0.5,
+    "xgb": 0.5
+  },
+  "metrics": {
+    "train_rmse": 6.670402526855469,
+    "train_corr": 0.9834232203802428,
+    "train_hit_rate": 0.8733333333333333,
+    "val_rmse": 5.781142711639404,
+    "val_corr": 0.9647032939763814,
+    "val_hit_rate": 0.79,
+    "test_rmse": 9.567610740661621,
+    "test_corr": 0.8074195821246404,
+    "test_hit_rate": 0.68
+  }
+}

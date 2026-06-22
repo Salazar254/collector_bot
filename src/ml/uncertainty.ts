@@ -42,6 +42,29 @@ export const summarizeMultiTask = (samples: Array<{
   pump2xProb: summarize(samples.map((item) => item.pump2xProb))
 });
 
-export const shouldBlockRugRisk = (mean: number, std: number): boolean => mean > 0.15 && std < 0.05;
+export interface RugBlockInput {
+  riskProbability: number;
+  uncertaintyStd: number;
+  threshold: number;
+  highUncertaintyStd?: number;
+  uncertainThresholdFactor?: number;
+}
+
+/**
+ * Fail-closed rug-probability gate. Blocks when the model is confident the token is
+ * risky (riskProbability over threshold, any uncertainty), AND when the model is
+ * uncertain about a token whose risk is already non-trivial. Uncertainty must never
+ * widen the path to "proceed" — it lowers the effective block threshold, it does not
+ * waive the block. Only a low-risk token the model is confident about passes cleanly.
+ */
+export const shouldBlockRugRisk = (input: RugBlockInput): boolean => {
+  const highUncertaintyStd = input.highUncertaintyStd ?? 0.05;
+  const uncertainThresholdFactor = input.uncertainThresholdFactor ?? 0.5;
+  if (input.riskProbability > input.threshold) {
+    return true;
+  }
+  const uncertain = input.uncertaintyStd >= highUncertaintyStd;
+  return uncertain && input.riskProbability > input.threshold * uncertainThresholdFactor;
+};
 
 export const shouldReviewUncertainty = (std: number): boolean => std > 0.10;

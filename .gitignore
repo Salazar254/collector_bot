@@ -1,22 +1,54 @@
-.env
-config/.env
-node_modules/
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
 dist/
 build/
-coverage/
-logs/
-*.log
-data/*.db
-data/*.db-shm
-data/*.db-wal
-data/*.png
-data/training/
-ml/saved_models/
-__pycache__/
-*.pyc
-.pytest_cache/
-venv/
+.eggs/
+*.egg
 .venv/
-*.egg-info/
-rug-filter-ts/.env
-rug-filter-ts/node_modules/
+venv/
+env/
+.env
+*.env
+!*.env.example
+
+# Pytest / coverage
+.pytest_cache/
+pytest-cache-files-*/
+.coverage
+htmlcov/
+*.log
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# TypeScript
+*.js.map
+*.d.ts
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Data / results (large files)
+results/
+*.parquet
+*.csv
+*.pkl
+*.npy
+
+# Secrets
+*.key
+*.pem
+*.secret

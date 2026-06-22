@@ -3,6 +3,10 @@ import { createLogger } from "./utils/logger.ts";
 import { TokenRiskScorer, type TokenLaunchEvent } from "./token_risk_scorer.ts";
 import { SniperEngine } from "./sniper_engine.ts";
 import { MemeAlphaStreamHub } from "./meme_alpha/streams.ts";
+import { EmergencyHaltServer } from "./emergency_halt.ts";
+import { PositionManager } from "./position_manager.ts";
+import { EntryPriceFeed, NullExitBackend } from "./position_backends.ts";
+import { RpcPool } from "./utils/rpc_pool.ts";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -51,8 +55,40 @@ export const main = async (): Promise<void> => {
   });
   const logger = createLogger(config.logLevel, { service: "meme-coin-bot" });
   const scorer = await TokenRiskScorer.load(config.scorer.modelPath, config.scorer, logger);
-  const engine = new SniperEngine(config, scorer, logger);
+  const rpc = new RpcPool(config.rpc, logger);
+  rpc.startHealthChecks();
+
+  const priceFeed = new EntryPriceFeed();
+  const engine = new SniperEngine(config, scorer, logger, { rpc, priceFeed });
+  const positionManager = new PositionManager(
+    engine.risk,
+    priceFeed,
+    new NullExitBackend(logger),
+    logger,
+    {
+      redisUrl: config.wallets.redisUrl,
+      pollIntervalMs: config.execution.positionPollIntervalMs,
+      maxHoldMs: config.scorer.maxHoldHorizonMs
+    }
+  );
+  engine.attachPositionManager(positionManager, priceFeed);
+
+  await positionManager.start();
   await engine.start();
+
+  const haltServer = new EmergencyHaltServer({
+    port: config.emergencyHaltPort,
+    risk: engine.risk,
+    logger
+  });
+  await haltServer.start();
+
+  const shutdown = async (): Promise<void> => {
+    rpc.stopHealthChecks();
+    await engine.stop();
+    await positionManager.stop();
+    await haltServer.stop();
+  };
 
   if (config.mode === "paper") {
     engine.ingestSocialPost({
@@ -66,7 +102,7 @@ export const main = async (): Promise<void> => {
     });
     engine.submit(sampleEvent());
     await engine.drain();
-    await engine.stop();
+    await shutdown();
     return;
   }
 
@@ -85,8 +121,16 @@ export const main = async (): Promise<void> => {
     mode: config.mode,
     streams: config.throughput.streamFanout,
     targetEventsPerHour: config.throughput.targetEventsPerHour,
-    memeAlphaStreams: Boolean(streamHub)
+    memeAlphaStreams: Boolean(streamHub),
+    emergencyHaltPort: config.emergencyHaltPort,
+    positionPollIntervalMs: config.execution.positionPollIntervalMs
   }, "live_engine_ready_for_stream_adapter");
+
+  const onSignal = (): void => {
+    void shutdown().finally(() => process.exit(0));
+  };
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
 };
 
 const loadEnv = async (): Promise<void> => {

@@ -45,27 +45,29 @@ export class WalletRotator {
     }
   }
 
-  nextWallet(): WalletRef {
+  nextWallet(): WalletRef | null {
     if (this.wallets.length === 0) {
       throw new Error("no_wallets_available");
     }
-    for (let attempt = 0; attempt < this.wallets.length; attempt += 1) {
-      const wallet = this.wallets[this.cursor % this.wallets.length];
+    const poolSize = this.wallets.length;
+    for (let attempt = 0; attempt < poolSize; attempt += 1) {
+      const wallet = this.wallets[this.cursor % poolSize];
       this.cursor += 1;
-      if (!wallet.disabled) {
+      if (!wallet.disabled && wallet.inFlight === 0) {
         wallet.lastUsedAt = Date.now();
         wallet.inFlight += 1;
         return wallet;
       }
     }
-    throw new Error("all_wallets_disabled");
+    return null;
   }
 
   complete(walletId: string): void {
     const wallet = this.wallets.find((item) => item.id === walletId);
-    if (wallet) {
-      wallet.inFlight = Math.max(0, wallet.inFlight - 1);
+    if (!wallet) {
+      return;
     }
+    wallet.inFlight = Math.max(0, wallet.inFlight - 1);
   }
 
   disable(walletId: string): void {

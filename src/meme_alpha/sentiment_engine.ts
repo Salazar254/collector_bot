@@ -210,11 +210,11 @@ export const normalizeKey = (value: string | undefined): string | undefined => {
 };
 
 const neutralSummary = (): SentimentSummary => ({
-  sentimentScore: 0.5,
+  sentimentScore: 0,
   whaleAccumulationScore: 0,
   retailFomoScore: 0,
   botSpamScore: 0,
-  credibilityScore: 0.5,
+  credibilityScore: 0,
   convictionScore: 0,
   samples: 0,
   reasons: []

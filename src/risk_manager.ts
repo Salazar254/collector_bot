@@ -1,4 +1,5 @@
 import type { MarketRegime, RiskConfig } from "./config.ts";
+import { shouldBlockRugRisk } from "./ml/uncertainty.ts";
 
 export interface RiskSignal {
   mint: string;
@@ -93,7 +94,7 @@ export class RiskManager {
       return this.rejected("duplicate_mint_position", signal.regime);
     }
     const uncertaintyStd = signal.rugUncertaintyStd ?? 0;
-    if (signal.riskProbability > 0.15 && uncertaintyStd < 0.05) {
+    if (shouldBlockRugRisk({ riskProbability: signal.riskProbability, uncertaintyStd, threshold: this.config.rugProbBlockThreshold })) {
       return this.rejected("risk_probability_block", signal.regime);
     }
     if (signal.volatility >= this.config.volatilitySpikeBlock) {
@@ -347,7 +348,7 @@ export class RiskManager {
   }
 
   alphaBoost(signal: RiskSignal): number {
-    const alpha = clamp(signal.memeAlphaScore ?? 0.55, 0, 1);
+    const alpha = clamp(signal.memeAlphaScore ?? 0, 0, 1);
     const whale = clamp(signal.whaleAccumulationScore ?? 0, 0, 1);
     const retail = clamp(signal.retailFomoScore ?? 0, 0, 1);
     const fomoPenalty = clamp(retail - whale, 0, 1) * 0.45;

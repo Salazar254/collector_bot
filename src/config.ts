@@ -2,6 +2,10 @@ export type RuntimeMode = "paper" | "live";
 export type MarketRegime = "normal" | "caution" | "stress" | "burst";
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
+// Single source of truth for the rug-probability block threshold. Both the scorer
+// and the risk manager read this same default so the two gates can never drift.
+export const RUG_PROB_BLOCK_THRESHOLD_DEFAULT = 0.15;
+
 export interface RpcConfig {
   httpUrls: string[];
   wsUrl?: string;
@@ -18,6 +22,14 @@ export interface JitoConfig {
   maxTipSol: number;
   tipFloorUrl: string;
   bundleOnly: boolean;
+  maxLandingPollAttempts: number;
+  landingPollIntervalMs: number;
+}
+
+export interface ExecutionConfig {
+  maxSlippagePct: number;
+  jupiterQuoteApiUrl: string;
+  positionPollIntervalMs: number;
 }
 
 export interface RiskConfig {
@@ -45,6 +57,7 @@ export interface RiskConfig {
   baseTakeProfitPct: number;
   consecutiveLossCircuitBreaker: number;
   maxDeployerPositions: number;
+  rugProbBlockThreshold: number;
 }
 
 export interface ScorerConfig {
@@ -55,6 +68,8 @@ export interface ScorerConfig {
   rugProbBlockThreshold: number;
   rugPullBlockThreshold: number;
   minLpBurnPct: number;
+  minLpLockPct: number;
+  maxHoldHorizonMs: number;
   honeypotRiskThreshold: number;
   maxTransferTaxPct: number;
   deployerBlacklist: Set<string>;
@@ -73,6 +88,7 @@ export interface ThroughputConfig {
   streamFanout: number;
   eventLoopBatchSize: number;
   maxQueueDepth: number;
+  maxEventAgeMs: number;
 }
 
 export interface MemeAlphaConfig {
@@ -95,6 +111,7 @@ export interface MemeAlphaConfig {
   blockOnAuditBudgetOverrun: boolean;
   requireMintAuthorityRenounced: boolean;
   requireFreezeAuthorityRenounced: boolean;
+  requireSocialContext: boolean;
   maxTopHolderPct: number;
   maxTop10HolderPct: number;
   maxDevHoldPct: number;
@@ -113,6 +130,7 @@ export interface BotConfig {
   wallets: WalletConfig;
   throughput: ThroughputConfig;
   memeAlpha: MemeAlphaConfig;
+  execution: ExecutionConfig;
 }
 
 const asNumber = (value: string | undefined, fallback: number): number => {
@@ -195,7 +213,9 @@ export const loadConfig = (env: NodeJS.ProcessEnv = process.env): BotConfig => {
       minTipSol: asNumber(env.JITO_MIN_TIP_SOL, 0.0001),
       maxTipSol: asNumber(env.JITO_MAX_TIP_SOL, 0.001),
       tipFloorUrl: env.JITO_TIP_FLOOR_URL || "https://bundles.jito.wtf/api/v1/bundles/tip_floor",
-      bundleOnly: true
+      bundleOnly: true,
+      maxLandingPollAttempts: asInt(env.JITO_MAX_LANDING_POLL_ATTEMPTS, 8),
+      landingPollIntervalMs: asInt(env.JITO_LANDING_POLL_INTERVAL_MS, 500)
     },
     risk: {
       startingCapitalSol,
@@ -221,16 +241,19 @@ export const loadConfig = (env: NodeJS.ProcessEnv = process.env): BotConfig => {
       baseStopLossPct: asNumber(env.BASE_STOP_LOSS_PCT, 0.12),
       baseTakeProfitPct: asNumber(env.BASE_TAKE_PROFIT_PCT, 0.24),
       consecutiveLossCircuitBreaker: asInt(env.CONSECUTIVE_LOSS_CIRCUIT_BREAKER, 5),
-      maxDeployerPositions: asInt(env.MAX_DEPLOYER_POSITIONS, 2)
+      maxDeployerPositions: asInt(env.MAX_DEPLOYER_POSITIONS, 2),
+      rugProbBlockThreshold: asNumber(env.RUG_PROB_BLOCK_THRESHOLD, RUG_PROB_BLOCK_THRESHOLD_DEFAULT)
     },
     scorer: {
       modelPath: env.RUG_MODEL_PATH || "./models/rug_model.json",
       rugcheckEnabled: asBool(env.RUGCHECK_ENABLED, false),
       rugcheckApiUrl: env.RUGCHECK_API_URL || "https://api.rugcheck.xyz",
       rugcheckApiKey: env.RUGCHECK_API_KEY,
-      rugProbBlockThreshold: asNumber(env.RUG_PROB_BLOCK_THRESHOLD, 0.15),
+      rugProbBlockThreshold: asNumber(env.RUG_PROB_BLOCK_THRESHOLD, RUG_PROB_BLOCK_THRESHOLD_DEFAULT),
       rugPullBlockThreshold: asNumber(env.RUG_PULL_BLOCK_THRESHOLD, 0.12),
       minLpBurnPct: asNumber(env.MIN_LP_BURN_PCT, 0.9),
+      minLpLockPct: asNumber(env.MIN_LP_LOCK_PCT, 90),
+      maxHoldHorizonMs: asInt(env.MAX_HOLD_HORIZON_MS, 24 * 3_600_000),
       honeypotRiskThreshold: asNumber(env.HONEYPOT_RISK_THRESHOLD, 0.1),
       maxTransferTaxPct: asNumber(env.MAX_TRANSFER_TAX_PCT, 0.08),
       deployerBlacklist: new Set(splitList(env.DEPLOYER_BLACKLIST))
@@ -246,7 +269,8 @@ export const loadConfig = (env: NodeJS.ProcessEnv = process.env): BotConfig => {
       targetTradesPerHour: asInt(env.TARGET_TRADES_PER_HOUR, 500),
       streamFanout: asInt(env.STREAM_FANOUT, 20),
       eventLoopBatchSize: asInt(env.EVENT_LOOP_BATCH_SIZE, 256),
-      maxQueueDepth: asInt(env.MAX_QUEUE_DEPTH, 50000)
+      maxQueueDepth: asInt(env.MAX_QUEUE_DEPTH, 50000),
+      maxEventAgeMs: asInt(env.MAX_EVENT_AGE_MS, 5000)
     },
     memeAlpha: {
       enabled: asBool(env.MEME_ALPHA_ENABLED, true),
@@ -268,9 +292,15 @@ export const loadConfig = (env: NodeJS.ProcessEnv = process.env): BotConfig => {
       blockOnAuditBudgetOverrun: asBool(env.ANTI_RUG_BLOCK_ON_BUDGET_OVERRUN, true),
       requireMintAuthorityRenounced: asBool(env.REQUIRE_MINT_AUTHORITY_RENOUNCED, true),
       requireFreezeAuthorityRenounced: asBool(env.REQUIRE_FREEZE_AUTHORITY_RENOUNCED, true),
+      requireSocialContext: asBool(env.REQUIRE_SOCIAL_CONTEXT, false),
       maxTopHolderPct: asNumber(env.MAX_TOP_HOLDER_PCT, 0.22),
       maxTop10HolderPct: asNumber(env.MAX_TOP10_HOLDER_PCT, 0.55),
       maxDevHoldPct: asNumber(env.MAX_DEV_HOLD_PCT, 0.08)
+    },
+    execution: {
+      maxSlippagePct: asNumber(env.MAX_SLIPPAGE_PCT, 1),
+      jupiterQuoteApiUrl: env.JUPITER_QUOTE_API_URL || "https://quote-api.jup.ag/v6/quote",
+      positionPollIntervalMs: asInt(env.POSITION_POLL_INTERVAL_MS, 30_000)
     }
   };
 };

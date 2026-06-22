@@ -7,6 +7,7 @@ export interface EmergencyHaltOptions {
   risk: RiskManager;
   logger: Logger;
   cancelPendingBundles?: () => Promise<void> | void;
+  resumeSecret?: string;
 }
 
 export class EmergencyHaltServer {
@@ -52,7 +53,18 @@ export class EmergencyHaltServer {
       return;
     }
     if (method === "POST" && url === "/resume") {
+      const secret = this.options.resumeSecret || process.env.EMERGENCY_HALT_SECRET;
+      if (secret) {
+        const provided = request.headers["x-halt-secret"] || request.headers["authorization"];
+        if (provided !== secret && provided !== `Bearer ${secret}`) {
+          this.options.logger.warn({ ip: request.socket.remoteAddress }, "resume_unauthorized");
+          this.json(response, 401, { error: "unauthorized" });
+          return;
+        }
+      }
+      // TODO: Replace shared-secret with proper auth (mTLS or JWT) before production
       this.options.risk.closeCircuit();
+      this.options.logger.info({ risk: this.options.risk.snapshot() }, "emergency_halt_resumed");
       this.json(response, 200, { halted: false, risk: this.options.risk.snapshot(), reviewRequired: true });
       return;
     }

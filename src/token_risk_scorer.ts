@@ -5,7 +5,14 @@ import type { Logger } from "./utils/logger.ts";
 import { DeployerLookup } from "./features/deployer_lookup.ts";
 import { SequenceBuffer } from "./features/sequence_buffer.ts";
 import { computeTabularFeatures } from "./features/feature_schema.ts";
+import {
+  evaluateLpProtection,
+  lpProtectionConfigFromScorer,
+  summarizeLockerVaults,
+  type RugCheckStatus
+} from "./lp_protection_gate.ts";
 import { OnnxRugScorer } from "./ml/onnx_scorer.ts";
+import { shouldBlockRugRisk } from "./ml/uncertainty.ts";
 
 export interface TokenLaunchEvent {
   mint: string;
@@ -53,7 +60,12 @@ export interface TokenLaunchEvent {
   retailFomoScore?: number;
   botSpamScore?: number;
   volumeBottleneckRatio?: number;
+  dataQuality?: "complete" | "incomplete";
   synthetic?: boolean;
+  cachedRugcheck?: RugCheckSummary;
+  lpLockedPct?: number;
+  lpLockExpiryMs?: number;
+  lpProtectionCachedAt?: number;
 }
 
 export interface TokenRiskResult {
@@ -77,8 +89,15 @@ export interface RugCheckSummary {
   freezeAuthority?: string | null;
   lpLocked?: boolean;
   lpLockedPct?: number;
+  lpLockExpiryMs?: number;
+  lpLockerTypes?: string[];
   topHoldersPct?: number;
   risks?: Array<{ name?: string; level?: string; description?: string }>;
+}
+
+export interface RugCheckFetchResult {
+  status: RugCheckStatus;
+  summary?: RugCheckSummary;
 }
 
 interface LinearModel {
@@ -127,6 +146,15 @@ export class TokenRiskScorer {
     const resolvedPath = await resolveModelPath(modelPath);
     let linearModelPath = resolvedPath;
     if (resolvedPath.toLowerCase().endsWith(".onnx")) {
+      const allowOnnx = ["1", "true", "yes", "on"].includes(
+        (process.env.ALLOW_ONNX_RUG_MODEL || "").trim().toLowerCase()
+      );
+      if (!allowOnnx) {
+        throw new Error(
+          "ONNX rug model is disabled pending retraining on 2025+ data. " +
+          "Set ALLOW_ONNX_RUG_MODEL=true to override."
+        );
+      }
       try {
         const deployerLookup = await DeployerLookup.load();
         const onnxScorer = await OnnxRugScorer.load(resolvedPath, { deployerLookup, mcPasses: 20 });
@@ -156,8 +184,20 @@ export class TokenRiskScorer {
     if (event.rugPullRisk > this.config.rugPullBlockThreshold) {
       reasons.push("rug_threshold");
     }
-    if (event.lpBurnPct < this.config.minLpBurnPct) {
-      reasons.push("lp_burn_below_90_pct");
+
+    const rugcheckFetch = await this.fetchRugCheck(event);
+    const rugcheck = rugcheckFetch.summary;
+    const lpGate = evaluateLpProtection(
+      {
+        lpBurnPct: event.lpBurnPct,
+        rugcheck,
+        rugcheckStatus: rugcheckFetch.status,
+        synthetic: event.synthetic
+      },
+      lpProtectionConfigFromScorer(this.config)
+    );
+    if (!lpGate.accepted) {
+      reasons.push(...lpGate.reasons);
     }
     if (event.honeypotRisk > this.config.honeypotRiskThreshold) {
       reasons.push("honeypot_risk");
@@ -166,11 +206,7 @@ export class TokenRiskScorer {
       reasons.push("transfer_tax");
     }
 
-    const rugcheck = await this.fetchRugCheck(event);
     if (rugcheck) {
-      if (typeof rugcheck.lpLockedPct === "number" && rugcheck.lpLockedPct < this.config.minLpBurnPct * 100) {
-        reasons.push("rugcheck_lp_lock");
-      }
       if (rugcheck.mintAuthority !== null && rugcheck.mintAuthority !== undefined) {
         reasons.push("rugcheck_mint_authority");
       }
@@ -184,7 +220,7 @@ export class TokenRiskScorer {
 
     const prediction = await this.predictFull(event, rugcheck);
     const riskProbability = prediction.riskProbability;
-    if (riskProbability > this.config.rugProbBlockThreshold && prediction.uncertainty < 0.05) {
+    if (shouldBlockRugRisk({ riskProbability, uncertaintyStd: prediction.uncertainty, threshold: this.config.rugProbBlockThreshold })) {
       reasons.push("ml_risk_probability");
     }
 
@@ -256,10 +292,14 @@ export class TokenRiskScorer {
     return "normal";
   }
 
-  async fetchRugCheck(event: TokenLaunchEvent): Promise<RugCheckSummary | undefined> {
-    if (!this.config.rugcheckEnabled || event.synthetic) {
-      return undefined;
+  async fetchRugCheck(event: TokenLaunchEvent): Promise<RugCheckFetchResult> {
+    if (event.synthetic) {
+      return { status: "synthetic" };
     }
+    if (!this.config.rugcheckEnabled) {
+      return { status: "disabled" };
+    }
+
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 900);
     try {
@@ -269,15 +309,46 @@ export class TokenRiskScorer {
       });
       if (!response.ok) {
         this.logger.warn({ mint: event.mint, status: response.status }, "rugcheck_request_failed");
-        return undefined;
+        return { status: "failed" };
       }
-      return await response.json() as RugCheckSummary;
+      const summary = await response.json() as RugCheckSummary;
+      const burnConfirmed = Number.isFinite(event.lpBurnPct) && event.lpBurnPct >= this.config.minLpBurnPct;
+      if (!burnConfirmed) {
+        const lockers = await this.fetchLockerVaults(event.mint, controller.signal);
+        if (lockers) {
+          summary.lpLockExpiryMs = lockers.lpLockExpiryMs;
+          summary.lpLockerTypes = lockers.lpLockerTypes;
+        }
+      }
+      return { status: "ok", summary };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.warn({ mint: event.mint, error: message }, "rugcheck_unavailable");
-      return undefined;
+      return { status: "failed" };
     } finally {
       clearTimeout(timeout);
+    }
+  }
+
+  private async fetchLockerVaults(
+    mint: string,
+    signal?: AbortSignal
+  ): Promise<{ lpLockExpiryMs?: number; lpLockerTypes: string[] } | undefined> {
+    try {
+      const response = await fetch(`${this.config.rugcheckApiUrl.replace(/\/$/, "")}/v1/tokens/${mint}/lockers`, {
+        headers: this.config.rugcheckApiKey ? { authorization: `Bearer ${this.config.rugcheckApiKey}` } : {},
+        signal
+      });
+      if (!response.ok) {
+        this.logger.warn({ mint, status: response.status }, "rugcheck_lockers_failed");
+        return undefined;
+      }
+      const payload = await response.json() as { lockers?: Record<string, { unlockDate?: number | string; type?: string }> | Array<{ unlockDate?: number | string; type?: string }> };
+      return summarizeLockerVaults(payload.lockers);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn({ mint, error: message }, "rugcheck_lockers_unavailable");
+      return undefined;
     }
   }
 }
