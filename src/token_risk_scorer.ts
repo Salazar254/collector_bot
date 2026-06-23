@@ -157,7 +157,14 @@ export class TokenRiskScorer {
       }
       try {
         const deployerLookup = await DeployerLookup.load();
-        const onnxScorer = await OnnxRugScorer.load(resolvedPath, { deployerLookup, mcPasses: 20 });
+        const onnxScorer = await OnnxRugScorer.load(resolvedPath, {
+          deployerLookup,
+          mcPasses: 20,
+          xgbModelPath: config.xgbModelPath,
+          xgbEnsembleWeight: config.xgbEnsembleWeight,
+          torchEnsembleWeight: config.torchEnsembleWeight,
+          logger: logger
+        });
         logger.info({ modelPath: resolvedPath }, "onnx_rug_model_loaded");
         return new TokenRiskScorer(config, logger, emptyLinearModel(), onnxScorer, new SequenceBuffer(), deployerLookup);
       } catch (error) {
@@ -255,7 +262,7 @@ export class TokenRiskScorer {
         temporalEmbedding: await this.sequenceBuffer.embeddingFor(event.mint, event.timestamp)
       });
       return {
-        riskProbability: clamp(scored.rugProb),
+        riskProbability: clamp(scored.riskProbability),
         timeToRugHours: scored.timeToRug,
         maxDrawdownPct: scored.maxDrawdown,
         pump2xProbability: clamp(scored.pump2xProb),

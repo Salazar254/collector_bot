@@ -15,6 +15,10 @@ import json
 import math
 import os
 import random
+import shutil
+import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -34,6 +38,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised by CLI envs.
 
 from sequence_encoder import SEQUENCE_LENGTH, SequenceEncoder
 from deployer_encoder import EMBEDDING_DIM
+from xgb_model import XGBModel
 
 
 FEATURE_NAMES = [
@@ -55,6 +60,16 @@ FEATURE_NAMES = [
 
 TRAIN_END = pd.Timestamp("2024-10-01T00:00:00Z")
 VAL_END = pd.Timestamp("2025-01-01T00:00:00Z")
+
+PARQUET_TRAIN_START = pd.Timestamp("2025-01-01T00:00:00Z")
+PARQUET_TRAIN_END = pd.Timestamp("2025-09-30T23:59:59Z")
+PARQUET_VAL_START = pd.Timestamp("2025-10-01T00:00:00Z")
+PARQUET_VAL_END = pd.Timestamp("2025-12-31T23:59:59Z")
+PARQUET_TEST_START = pd.Timestamp("2026-01-01T00:00:00Z")
+
+XGB_ENSEMBLE_WEIGHT = 0.4
+TORCH_ENSEMBLE_WEIGHT = 0.6
+GITHUB_REPO = "https://github.com/Salazar254/meme_coin"
 
 
 @dataclass
@@ -709,20 +724,287 @@ def save_outputs(
         json.dump(deployer_to_id, handle, indent=2)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", default="data/training")
-    parser.add_argument("--output", default="models/rug_model.onnx")
-    parser.add_argument("--checkpoint", default="models/rug_model_best.pt")
-    parser.add_argument("--meta", default="models/rug_model_meta.json")
-    parser.add_argument("--epochs", type=int, default=60)
-    parser.add_argument("--batch-size", type=int, default=512)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--seed", type=int, default=20260505)
-    parser.add_argument("--skip-cv", action="store_true")
-    parser.add_argument("--max-samples-per-split", type=int, default=0)
-    args = parser.parse_args()
+def parquet_row_to_example(row: pd.Series) -> Example:
+    timestamp = parse_timestamp(row.get("decision_timestamp") or row.get("timestamp"))
+    tabular = row.get("tabular")
+    if isinstance(tabular, str):
+        tabular = json.loads(tabular)
+    if tabular is None:
+        tabular = [safe_float(row.get(name)) for name in FEATURE_NAMES]
+    sequence = row.get("sequence")
+    if isinstance(sequence, str):
+        sequence = json.loads(sequence)
+    if sequence is None:
+        features = dict(zip(FEATURE_NAMES, tabular))
+        sequence = default_sequence(features)
+    return Example(
+        timestamp=timestamp,
+        deployer=str(row.get("deployer") or "unknown"),
+        features=[safe_float(value) for value in tabular[: len(FEATURE_NAMES)]],
+        sequence=sequence,
+        rug_label=float(row.get("rug_label") or 0.0),
+        time_to_rug_hours=float(row.get("time_to_rug_hours") or 24.0),
+        max_drawdown_pct=float(row.get("max_drawdown_pct") or 0.0),
+        pump_2x_label=float(row.get("pump_2x_label") or row.get("pump_2x") or 0.0),
+        weight=float(row.get("weight") or 1.0),
+    )
 
+
+def load_parquet_examples(path: str) -> list[Example]:
+    frame = pd.read_parquet(path)
+    return [parquet_row_to_example(row) for _, row in frame.iterrows()]
+
+
+def split_temporal_parquet(examples: list[Example]) -> tuple[list[Example], list[Example], list[Example]]:
+    train = [item for item in examples if PARQUET_TRAIN_START <= item.timestamp <= PARQUET_TRAIN_END]
+    val = [item for item in examples if PARQUET_VAL_START <= item.timestamp <= PARQUET_VAL_END]
+    test = [item for item in examples if item.timestamp >= PARQUET_TEST_START]
+    if train and val and test:
+        return train, val, test
+    return split_temporal(examples)
+
+
+def train_xgb_classifier(
+    train: list[Example],
+    val: list[Example],
+) -> XGBModel:
+    xgb_model = XGBModel(
+        task="classification",
+        params={
+            "n_estimators": 300,
+            "max_depth": 5,
+            "learning_rate": 0.05,
+            "subsample": 0.8,
+            "colsample_bytree": 0.8,
+            "eval_metric": "auc",
+            "tree_method": "hist",
+        },
+    )
+    x_train = np.asarray([item.features for item in train], dtype=np.float32)
+    y_train = np.asarray([item.rug_label for item in train], dtype=np.float32)
+    x_val = np.asarray([item.features for item in val], dtype=np.float32)
+    y_val = np.asarray([item.rug_label for item in val], dtype=np.float32)
+    xgb_model.train_model(x_train, y_train, x_val, y_val)
+    return xgb_model
+
+
+def evaluate_hybrid_ensemble(
+    xgb_model: XGBModel,
+    torch_model: RugRiskNet,
+    test: list[Example],
+    deployer_to_id: dict[str, int],
+) -> dict[str, float]:
+    from sklearn.metrics import roc_auc_score
+
+    x_test = np.asarray([item.features for item in test], dtype=np.float32)
+    y_test = np.asarray([item.rug_label for item in test], dtype=np.float32)
+    xgb_probs = xgb_model.predict_batch(x_test)
+    torch_probs, _ = predict_rug(torch_model, build_tensors(test, deployer_to_id))
+    ensemble = (xgb_probs * XGB_ENSEMBLE_WEIGHT) + (torch_probs * TORCH_ENSEMBLE_WEIGHT)
+    xgb_auc = float(roc_auc_score(y_test, xgb_probs)) if len(np.unique(y_test)) > 1 else 0.5
+    torch_auc = float(roc_auc_score(y_test, torch_probs)) if len(np.unique(y_test)) > 1 else 0.5
+    ensemble_auc = float(roc_auc_score(y_test, ensemble)) if len(np.unique(y_test)) > 1 else 0.5
+    correlation = float(np.corrcoef(xgb_probs, torch_probs)[0, 1]) if len(xgb_probs) > 1 else 0.0
+    return {
+        "xgb_test_auc": xgb_auc,
+        "pytorch_test_auc": torch_auc,
+        "ensemble_test_auc": ensemble_auc,
+        "xgb_vs_pytorch_correlation": correlation,
+    }
+
+
+def save_hybrid_outputs(
+    xgb_model: XGBModel,
+    torch_model: RugRiskNet,
+    deployer_to_id: dict[str, int],
+    metrics: dict[str, Any],
+    ensemble_metrics: dict[str, float],
+    xgb_out: str,
+    rug_out: str,
+    meta_out: str,
+    deployer_out: str,
+    feature_importance_out: str,
+    n_train: int,
+) -> dict[str, Any]:
+    os.makedirs(os.path.dirname(xgb_out) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(rug_out) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(meta_out) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(deployer_out) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(feature_importance_out) or ".", exist_ok=True)
+
+    xgb_model.export_onnx(xgb_out, n_features=len(FEATURE_NAMES))
+    xgb_model.validate_onnx(xgb_out, n_features=len(FEATURE_NAMES))
+    export_onnx(torch_model, rug_out)
+
+    importances = xgb_model.feature_importance(FEATURE_NAMES)
+    trained_at = datetime.now(timezone.utc).isoformat()
+    feature_payload = {
+        "trained_at": trained_at,
+        "top_features": [
+            {"feature": name, "importance": round(float(score), 4)}
+            for name, score in importances.items()
+        ],
+        "xgb_vs_pytorch_correlation": round(ensemble_metrics["xgb_vs_pytorch_correlation"], 4),
+    }
+    with open(feature_importance_out, "w", encoding="utf-8") as handle:
+        json.dump(feature_payload, handle, indent=2)
+
+    metadata = {
+        "version": 2,
+        "trained_at": trained_at,
+        "train_period": str(PARQUET_TRAIN_END.date()),
+        "val_period": str(PARQUET_VAL_END.date()),
+        "test_period": "2026-01-01 to present",
+        "xgb_test_auc": round(ensemble_metrics["xgb_test_auc"], 4),
+        "pytorch_test_auc": round(ensemble_metrics["pytorch_test_auc"], 4),
+        "ensemble_test_auc": round(ensemble_metrics["ensemble_test_auc"], 4),
+        "quality_gate_passed": True,
+        "sequence_length": SEQUENCE_LENGTH,
+        "tabular_features": len(FEATURE_NAMES),
+        "xgb_n_estimators": 300,
+        "xgb_max_depth": 5,
+        "ensemble_weights": {"xgb": XGB_ENSEMBLE_WEIGHT, "pytorch": TORCH_ENSEMBLE_WEIGHT},
+        "architecture": "hybrid_xgb_pytorch_rug_risknet",
+        "onnx_opset": 15,
+        "feature_names": FEATURE_NAMES,
+        "metrics": metrics,
+        "n_train": n_train,
+    }
+    with open(meta_out, "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2)
+    with open(deployer_out, "w", encoding="utf-8") as handle:
+        json.dump(deployer_to_id, handle, indent=2)
+    return metadata
+
+
+def push_to_github(token: str, files: list[str], message: str) -> None:
+    if not token:
+        print("GITHUB_TOKEN not set — skipping push")
+        return
+    repo_dest = {
+        "models/xgb_model.onnx": "models/xgb_model.onnx",
+        "models/rug_model.onnx": "models/rug_model.onnx",
+        "models/deployer_lookup.json": "models/deployer_lookup.json",
+        "models/rug_model_meta.json": "models/rug_model_meta.json",
+        "ml/data/raw_data.parquet": "ml/data/raw_data.parquet",
+        "ml/data/feature_importance.json": "ml/data/feature_importance.json",
+    }
+    local_to_repo = {}
+    for path in files:
+        normalized = path.replace("\\", "/")
+        basename = os.path.basename(normalized)
+        for repo_path in repo_dest:
+            if normalized.endswith(repo_path) or basename == os.path.basename(repo_path):
+                local_to_repo[path] = repo_path
+                break
+        else:
+            if basename in {os.path.basename(item) for item in repo_dest}:
+                for repo_path in repo_dest:
+                    if os.path.basename(repo_path) == basename:
+                        local_to_repo[path] = repo_path
+                        break
+    if not local_to_repo:
+        print("No recognized files to push — skipping")
+        return
+    try:
+        with tempfile.TemporaryDirectory(prefix="retrain_repo_") as temp_dir:
+            clone_dir = os.path.join(temp_dir, "repo")
+            repo_url = GITHUB_REPO.replace("https://", f"https://{token}@")
+            subprocess.run(["git", "clone", repo_url, clone_dir], check=True, capture_output=True)
+            for src, dst in local_to_repo.items():
+                if not os.path.exists(src):
+                    continue
+                target = os.path.join(clone_dir, dst)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                shutil.copy2(src, target)
+            subprocess.run(["git", "add", *local_to_repo.values()], cwd=clone_dir, check=True, capture_output=True)
+            status = subprocess.run(["git", "status", "--porcelain"], cwd=clone_dir, check=True, capture_output=True, text=True)
+            if not status.stdout.strip():
+                print("No git changes to push")
+                return
+            subprocess.run(["git", "config", "user.email", "retrain@bot"], cwd=clone_dir, check=True)
+            subprocess.run(["git", "config", "user.name", "Retrain Bot"], cwd=clone_dir, check=True)
+            subprocess.run(["git", "commit", "-m", message], cwd=clone_dir, check=True, capture_output=True)
+            push = subprocess.run(["git", "push", "origin", "master"], cwd=clone_dir, capture_output=True, text=True)
+            if push.returncode != 0:
+                push = subprocess.run(["git", "push", "origin", "main"], cwd=clone_dir, capture_output=True, text=True)
+            if push.returncode == 0:
+                print(f"Pushed to GitHub: {message}")
+            else:
+                print(f"GitHub push failed: {push.stderr or push.stdout}")
+    except Exception as exc:
+        print(f"GitHub push warning: {exc}")
+
+
+def run_hybrid_training(args: argparse.Namespace) -> None:
+    examples = load_parquet_examples(args.data)
+    if len(examples) < 100:
+        raise SystemExit(f"not_enough_training_examples:{len(examples)} in {args.data}")
+
+    train, val, test = split_temporal_parquet(examples)
+    if not train or not val or not test:
+        raise SystemExit("temporal_split_empty: need train, validation, and test samples")
+
+    print(f"Training XGBoost on {len(train)} train / {len(val)} val samples...")
+    xgb_model = train_xgb_classifier(train, val)
+    importances = xgb_model.feature_importance(FEATURE_NAMES)
+    print("Top 5 XGB features:")
+    for name, score in list(importances.items())[:5]:
+        print(f"  {name}: {score:.4f}")
+
+    print(f"Training PyTorch RugRiskNet on {len(train)} train samples...")
+    torch_model, metrics, deployer_to_id = train_model(
+        train,
+        val,
+        test,
+        args.epochs,
+        args.batch_size,
+        args.lr,
+        args.seed,
+    )
+
+    ensemble_metrics = evaluate_hybrid_ensemble(xgb_model, torch_model, test, deployer_to_id)
+    ensemble_auc = ensemble_metrics["ensemble_test_auc"]
+    print(json.dumps(ensemble_metrics, indent=2))
+
+    if ensemble_auc < args.min_auc:
+        print(f"QUALITY GATE FAILED: {ensemble_auc:.4f}")
+        print("Existing models NOT overwritten.")
+        sys.exit(1)
+
+    metadata = save_hybrid_outputs(
+        xgb_model,
+        torch_model,
+        deployer_to_id,
+        metrics,
+        ensemble_metrics,
+        args.xgb_out,
+        args.rug_out,
+        args.meta_out,
+        args.deployer_out,
+        args.feature_importance_out,
+        len(train),
+    )
+
+    commit_msg = (
+        f"retrain: hybrid XGB+PyTorch {datetime.now(timezone.utc).date()} | "
+        f"ensemble_auc={ensemble_auc:.4f} | "
+        f"n_train={len(train)} | xgb_auc={ensemble_metrics['xgb_test_auc']:.4f} | "
+        f"torch_auc={ensemble_metrics['pytorch_test_auc']:.4f}"
+    )
+    push_files = [
+        args.xgb_out,
+        args.rug_out,
+        args.deployer_out,
+        args.meta_out,
+        args.data,
+        args.feature_importance_out,
+    ]
+    push_to_github(os.environ.get("GITHUB_TOKEN", ""), push_files, commit_msg)
+    print(json.dumps({"metadata": metadata, "ensemble_metrics": ensemble_metrics}, indent=2))
+
+
+def run_legacy_training(args: argparse.Namespace) -> None:
     examples = load_examples(args.data_dir)
     if len(examples) < 1000:
         raise SystemExit(f"not_enough_training_examples:{len(examples)} in {args.data_dir}")
@@ -750,6 +1032,33 @@ def main() -> None:
         "test_auc": metrics["test"]["auc"],
         "leakage_flags": importance.get("leakage_flags", []),
     }, indent=2))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", default="", help="Parquet training dataset for hybrid pipeline")
+    parser.add_argument("--xgb-out", default="models/xgb_model.onnx")
+    parser.add_argument("--rug-out", default="models/rug_model.onnx")
+    parser.add_argument("--meta-out", default="models/rug_model_meta.json")
+    parser.add_argument("--deployer-out", default="models/deployer_lookup.json")
+    parser.add_argument("--feature-importance-out", default="ml/data/feature_importance.json")
+    parser.add_argument("--min-auc", type=float, default=0.65)
+    parser.add_argument("--data-dir", default="data/training")
+    parser.add_argument("--output", default="models/rug_model.onnx")
+    parser.add_argument("--checkpoint", default="models/rug_model_best.pt")
+    parser.add_argument("--meta", default="models/rug_model_meta.json")
+    parser.add_argument("--epochs", type=int, default=60)
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--seed", type=int, default=20260505)
+    parser.add_argument("--skip-cv", action="store_true")
+    parser.add_argument("--max-samples-per-split", type=int, default=0)
+    args = parser.parse_args()
+
+    if args.data:
+        run_hybrid_training(args)
+        return
+    run_legacy_training(args)
 
 
 if __name__ == "__main__":

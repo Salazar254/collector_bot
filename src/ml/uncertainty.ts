@@ -13,7 +13,10 @@ export interface MultiTaskUncertainty {
   pump2xProb: DistributionSummary;
 }
 
-export const clamp = (value: number, low = 0, high = 1): number => Math.max(low, Math.min(high, value));
+export const clamp = (value: number, low = 0, high = 1): number => {
+  if (!Number.isFinite(value)) return low;
+  return Math.max(low, Math.min(high, value));
+};
 
 export const summarize = (values: number[]): DistributionSummary => {
   if (values.length === 0) {

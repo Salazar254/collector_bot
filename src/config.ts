@@ -62,6 +62,9 @@ export interface RiskConfig {
 
 export interface ScorerConfig {
   modelPath: string;
+  xgbModelPath: string;
+  xgbEnsembleWeight: number;
+  torchEnsembleWeight: number;
   rugcheckEnabled: boolean;
   rugcheckApiUrl: string;
   rugcheckApiKey?: string;
@@ -246,6 +249,9 @@ export const loadConfig = (env: NodeJS.ProcessEnv = process.env): BotConfig => {
     },
     scorer: {
       modelPath: env.RUG_MODEL_PATH || "./models/rug_model.json",
+      xgbModelPath: env.XGB_MODEL_PATH || "./models/xgb_model.onnx",
+      xgbEnsembleWeight: asNumber(env.XGB_ENSEMBLE_WEIGHT, 0.4),
+      torchEnsembleWeight: asNumber(env.TORCH_ENSEMBLE_WEIGHT, 0.6),
       rugcheckEnabled: asBool(env.RUGCHECK_ENABLED, false),
       rugcheckApiUrl: env.RUGCHECK_API_URL || "https://api.rugcheck.xyz",
       rugcheckApiKey: env.RUGCHECK_API_KEY,
