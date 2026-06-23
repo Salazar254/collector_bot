@@ -1,6 +1,11 @@
 torch
 onnx
 onnxscript
+onnxruntime
+skl2onnx
+onnxmltools
+xgboost
+scikit-learn
 pandas
 pyarrow
 shap

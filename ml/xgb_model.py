@@ -88,6 +88,41 @@ class XGBModel:
             feature_names = FEATURE_NAMES
         return dict(zip(feature_names, self.feature_importance_.tolist()))
 
+    def feature_importance(self, feature_names: list[str]) -> dict:
+        importances = self.model.feature_importances_
+        return dict(sorted(
+            zip(feature_names, importances),
+            key=lambda x: x[1],
+            reverse=True
+        ))
+
+    def export_onnx(self, output_path: str, n_features: int = 14) -> None:
+        from onnxmltools import convert_xgboost
+        from onnxmltools.convert.common.data_types import FloatTensorType as OnnxFloatTensorType
+
+        initial_types = [
+            ("tabular_input", OnnxFloatTensorType([None, n_features]))
+        ]
+        onnx_model = convert_xgboost(
+            self.model,
+            initial_types=initial_types,
+        )
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        with open(output_path, "wb") as handle:
+            handle.write(onnx_model.SerializeToString())
+        print(f"XGBoost ONNX exported to {output_path}")
+
+    def validate_onnx(self, onnx_path: str, n_features: int = 14) -> bool:
+        import onnxruntime as ort
+
+        sess = ort.InferenceSession(onnx_path)
+        test_input = np.random.rand(1, n_features).astype(np.float32)
+        result = sess.run(None, {"tabular_input": test_input})
+        prob = result[1][0][1]
+        assert 0 <= prob <= 1, f"XGB ONNX output out of range: {prob}"
+        print(f"XGB ONNX validation passed. Sample rug_prob: {prob:.4f}")
+        return True
+
     def save(self, path: str = "ml/saved_models/xgb_model.json"):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         self.model.save_model(path)

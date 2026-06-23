@@ -16,6 +16,9 @@ torchvision>=0.17.0
 # ML - Gradient Boosting
 xgboost>=2.0.0
 scikit-learn>=1.4.0
+skl2onnx>=1.16.0
+onnxmltools>=1.11.0
+onnxruntime>=1.17.0
 
 # Visualization
 matplotlib>=3.8.0
