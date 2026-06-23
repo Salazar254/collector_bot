@@ -764,6 +764,9 @@ def split_temporal_parquet(examples: list[Example]) -> tuple[list[Example], list
     return split_temporal(examples)
 
 
+XGB_FEATURE_NAMES = [f for f in FEATURE_NAMES if f != "rugPullRisk"]  # 13 features, no leakage
+
+
 def train_xgb_classifier(
     train: list[Example],
     val: list[Example],
@@ -772,17 +775,19 @@ def train_xgb_classifier(
         task="classification",
         params={
             "n_estimators": 300,
-            "max_depth": 5,
+            "max_depth": 4,
             "learning_rate": 0.05,
             "subsample": 0.8,
-            "colsample_bytree": 0.8,
+            "colsample_bytree": 0.4,
+            "reg_alpha": 1.0,
+            "reg_lambda": 2.0,
             "eval_metric": "auc",
             "tree_method": "hist",
         },
     )
-    x_train = np.asarray([item.features for item in train], dtype=np.float32)
+    x_train = np.asarray([item.features[1:] for item in train], dtype=np.float32)
     y_train = np.asarray([item.rug_label for item in train], dtype=np.float32)
-    x_val = np.asarray([item.features for item in val], dtype=np.float32)
+    x_val = np.asarray([item.features[1:] for item in val], dtype=np.float32)
     y_val = np.asarray([item.rug_label for item in val], dtype=np.float32)
     xgb_model.train_model(x_train, y_train, x_val, y_val)
     return xgb_model
@@ -796,7 +801,7 @@ def evaluate_hybrid_ensemble(
 ) -> dict[str, float]:
     from sklearn.metrics import roc_auc_score
 
-    x_test = np.asarray([item.features for item in test], dtype=np.float32)
+    x_test = np.asarray([item.features[1:] for item in test], dtype=np.float32)
     y_test = np.asarray([item.rug_label for item in test], dtype=np.float32)
     xgb_probs = xgb_model.predict_batch(x_test)
     torch_probs, _ = predict_rug(torch_model, build_tensors(test, deployer_to_id))
@@ -832,8 +837,8 @@ def save_hybrid_outputs(
     os.makedirs(os.path.dirname(deployer_out) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(feature_importance_out) or ".", exist_ok=True)
 
-    xgb_model.export_onnx(xgb_out, n_features=len(FEATURE_NAMES))
-    xgb_model.validate_onnx(xgb_out, n_features=len(FEATURE_NAMES))
+    xgb_model.export_onnx(xgb_out, n_features=len(XGB_FEATURE_NAMES))
+    xgb_model.validate_onnx(xgb_out, n_features=len(XGB_FEATURE_NAMES))
     export_onnx(torch_model, rug_out)
 
     importances = xgb_model.feature_importance(FEATURE_NAMES)
@@ -947,7 +952,7 @@ def run_hybrid_training(args: argparse.Namespace) -> None:
 
     print(f"Training XGBoost on {len(train)} train / {len(val)} val samples...")
     xgb_model = train_xgb_classifier(train, val)
-    importances = xgb_model.feature_importance(FEATURE_NAMES)
+    importances = xgb_model.feature_importance(XGB_FEATURE_NAMES)
     print("Top 5 XGB features:")
     for name, score in list(importances.items())[:5]:
         print(f"  {name}: {score:.4f}")

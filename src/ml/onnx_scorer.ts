@@ -177,9 +177,10 @@ export class OnnxRugScorer {
     }
 
     try {
-      const input = new this.ort.Tensor("float32", Float32Array.from(tabular), [1, 14]);
-      if (input.dims[1] !== 14) {
-        throw new Error(`XGB tabular shape mismatch: expected [1,14] got [1,${input.dims[1]}]`);
+      const xgbFeatures = tabular.slice(1);
+      const input = new this.ort.Tensor("float32", Float32Array.from(xgbFeatures), [1, 13]);
+      if (input.dims[1] !== 13) {
+        throw new Error(`XGB tabular shape mismatch: expected [1,13] got [1,${input.dims[1]}]`);
       }
 
       const result = await this.xgbSession.run({ tabular_input: input });

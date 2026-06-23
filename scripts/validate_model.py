@@ -12,6 +12,7 @@ import numpy as np
 
 NOISE_FEATURES = {"hour_of_day", "is_weekend"}
 EXPECTED_FEATURES = 14
+EXPECTED_XGB_FEATURES = 13
 EXPECTED_SEQUENCE_LENGTH = 16
 MIN_ENSEMBLE_AUC = 0.65
 XGB_WEIGHT = 0.4
@@ -62,12 +63,12 @@ def main() -> int:
 
     if xgb_sess is not None:
         try:
-            test_tab = np.random.rand(1, EXPECTED_FEATURES).astype(np.float32)
+            test_tab = np.random.rand(1, EXPECTED_XGB_FEATURES).astype(np.float32)
             xgb_out = xgb_sess.run(None, {"tabular_input": test_tab})
-            prob = float(xgb_out[1][0][1])
-            results.append(check("xgb input [1,14] accepted, output in [0,1]", 0 <= prob <= 1, f"prob={prob:.4f}"))
+            prob = float(xgb_out[0][0][1]) if len(xgb_out[0].shape) > 1 else float(xgb_out[1][0][1])
+            results.append(check("xgb input [1,13] accepted, output in [0,1]", 0 <= prob <= 1, f"prob={prob:.4f}"))
         except Exception as exc:
-            results.append(check("xgb input [1,14] accepted, output in [0,1]", False, str(exc)))
+            results.append(check("xgb input [1,13] accepted, output in [0,1]", False, str(exc)))
 
     try:
         rug_sess = ort.InferenceSession(str(rug_path))
@@ -119,9 +120,9 @@ def main() -> int:
 
     if xgb_sess is not None and torch_prob is not None:
         try:
-            test_tab = np.random.rand(1, EXPECTED_FEATURES).astype(np.float32)
+            test_tab = np.random.rand(1, EXPECTED_XGB_FEATURES).astype(np.float32)
             xgb_out = xgb_sess.run(None, {"tabular_input": test_tab})
-            xgb_prob = float(xgb_out[1][0][1])
+            xgb_prob = float(xgb_out[0][0][1]) if len(xgb_out[0].shape) > 1 else float(xgb_out[1][0][1])
             ensemble = (xgb_prob * XGB_WEIGHT) + (torch_prob * TORCH_WEIGHT)
             results.append(check("ensemble = (xgb*0.4)+(torch*0.6) in [0,1]", 0 <= ensemble <= 1, f"ensemble={ensemble:.4f}"))
         except Exception as exc:

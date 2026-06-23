@@ -96,7 +96,7 @@ class XGBModel:
             reverse=True
         ))
 
-    def export_onnx(self, output_path: str, n_features: int = 14) -> None:
+    def export_onnx(self, output_path: str, n_features: int = 13) -> None:
         from onnxmltools import convert_xgboost
         from onnxmltools.convert.common.data_types import FloatTensorType as OnnxFloatTensorType
 
@@ -112,13 +112,13 @@ class XGBModel:
             handle.write(onnx_model.SerializeToString())
         print(f"XGBoost ONNX exported to {output_path}")
 
-    def validate_onnx(self, onnx_path: str, n_features: int = 14) -> bool:
+    def validate_onnx(self, onnx_path: str, n_features: int = 13) -> bool:
         import onnxruntime as ort
 
         sess = ort.InferenceSession(onnx_path)
         test_input = np.random.rand(1, n_features).astype(np.float32)
         result = sess.run(None, {"tabular_input": test_input})
-        prob = result[1][0][1]
+        prob = float(result[0][0][1]) if len(result[0].shape) > 1 else float(result[1][0][1])
         assert 0 <= prob <= 1, f"XGB ONNX output out of range: {prob}"
         print(f"XGB ONNX validation passed. Sample rug_prob: {prob:.4f}")
         return True
