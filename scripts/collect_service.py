@@ -2,23 +2,29 @@
 scripts/collect_service.py — Standalone data collection service.
 
 Runs as a long-running Python service on Render.com free tier.
-Continuously collects graduated pump.fun token data from Helius
-and saves to Supabase.  Runs for days uninterrupted.
+Continuously collects graduated pump.fun token data from
+Helius + DexScreener and saves to Supabase free tier.
+
+KEY CONSTRAINT: Supabase free tier = 500 MB limit.
+Sequence data is stored as compressed float16 base64
+to fit 1M rows within 500 MB.
 
 ENVIRONMENT VARIABLES (set in Render dashboard):
   HELIUS_API_KEY=
   SUPABASE_URL=
   SUPABASE_KEY=
   COLLECTION_INTERVAL_SECONDS=30
-  PORT=8080                          # keep-alive HTTP server
+  PORT=8080
 """
 
 import os
 import time
 import json
 import sys
-import requests
 import logging
+import requests
+import numpy as np
+import base64
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from threading import Thread
@@ -36,13 +42,63 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Sequence compression utilities  (PART 2)
+# ---------------------------------------------------------------------------
+
+SEQUENCE_LENGTH = 16
+SEQUENCE_FEATURES = 6
+# Feature order must match src/features/sequence_buffer.ts
+# [holders, liquidity, volume, ratio, velocity, tx_count]
+
+
+def compress_sequence(sequence: list) -> str:
+    """
+    Converts [16, 6] float list to compressed base64.
+    Uses float16 (half precision) — sufficient for
+    training, 3x smaller than float32 JSONB.
+
+    Size: 16 × 6 × 2 bytes = 192 bytes raw
+          × 4/3 base64 overhead = ~256 bytes as TEXT
+    """
+    arr = np.array(sequence, dtype=np.float16)
+    if arr.shape != (SEQUENCE_LENGTH, SEQUENCE_FEATURES):
+        # Pad or truncate to correct shape
+        padded = np.zeros(
+            (SEQUENCE_LENGTH, SEQUENCE_FEATURES),
+            dtype=np.float16,
+        )
+        rows = min(len(sequence), SEQUENCE_LENGTH)
+        padded[:rows] = arr[:rows]
+        arr = padded
+    return base64.b64encode(arr.tobytes()).decode("utf-8")
+
+
+def decompress_sequence(b64_str: str) -> np.ndarray:
+    """
+    Converts compressed base64 back to [16, 6] float32.
+    Called during Colab training data loading.
+    Returns float32 for PyTorch compatibility.
+    """
+    raw = base64.b64decode(b64_str)
+    arr = np.frombuffer(raw, dtype=np.float16)
+    return arr.reshape(SEQUENCE_LENGTH, SEQUENCE_FEATURES).astype(np.float32)
+
+
+def zero_sequence() -> str:
+    """Returns a compressed all-zero sequence."""
+    return compress_sequence(
+        [[0.0] * SEQUENCE_FEATURES for _ in range(SEQUENCE_LENGTH)]
+    )
+
+
+# ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
 HELIUS_KEY = os.environ["HELIUS_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-INTERVAL = int(os.environ.get("COLLECTION_INTERVAL_SECONDS", 30))
-KEEPALIVE_PORT = int(os.environ.get("PORT", 8080))
+INTERVAL = int(os.environ.get("COLLECTION_INTERVAL_SECONDS", "30"))
+KEEPALIVE_PORT = int(os.environ.get("PORT", "8080"))
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -58,49 +114,22 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # ===================================================================
-# HELIUS API HELPERS
+# API HELPERS
 # ===================================================================
 
 
-def _helius_get(url: str, params: dict | None = None) -> dict | list | None:
-    """GET request to Helius REST API with retry + rate-limit handling."""
-    for attempt in range(5):
+def with_retry(fn, max_retries=5, base_wait=1.0):
+    """Exponential backoff retry for all API calls."""
+    for attempt in range(max_retries):
         try:
-            r = requests.get(url, params=params, timeout=15)
-            if r.status_code == 200:
-                return r.json()
-            if r.status_code == 429:
-                wait = (2 ** attempt) + 1
-                log.warning("Rate limited, waiting %ds", wait)
-                time.sleep(wait)
-            else:
-                log.error("Helius GET %s → HTTP %d", url[:80], r.status_code)
-                return None
-        except requests.RequestException as e:
-            log.error("Helius GET failed: %s", e)
-            time.sleep(5)
-    return None
-
-
-def _helius_rpc(method: str, params: dict) -> dict | None:
-    """JSON-RPC call to Helius RPC endpoint."""
-    url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}"
-    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-    for attempt in range(5):
-        try:
-            r = requests.post(url, json=payload, timeout=15)
-            if r.status_code == 200:
-                return r.json()
-            if r.status_code == 429:
-                wait = (2 ** attempt) + 1
-                log.warning("RPC rate limited, waiting %ds", wait)
-                time.sleep(wait)
-            else:
-                log.error("Helius RPC %s → HTTP %d", method, r.status_code)
-                return None
-        except requests.RequestException as e:
-            log.error("Helius RPC failed: %s", e)
-            time.sleep(5)
+            result = fn()
+            if result is not None:
+                return result
+        except Exception as e:
+            log.warning("Attempt %d failed: %s", attempt + 1, e)
+        wait = (base_wait * 2 ** attempt) + (0.1 * attempt)
+        log.info("Waiting %.1fs before retry", wait)
+        time.sleep(wait)
     return None
 
 
@@ -117,6 +146,37 @@ def get_existing_mints() -> set[str]:
     except Exception as e:
         log.error("Failed to fetch existing mints: %s", e)
         return set()
+
+
+def save_to_supabase(record: dict) -> bool:
+    """Upsert a single token record into the training_tokens table."""
+    try:
+        supabase.table("training_tokens").upsert(
+            record, on_conflict="mint",
+        ).execute()
+        return True
+    except Exception as e:
+        log.error("Supabase upsert failed for %s: %s", record.get("mint", "?"), e)
+        return False
+
+
+def save_batch(records: list[dict]) -> int:
+    """Upsert a batch of records into Supabase.  Returns count saved."""
+    if not records:
+        return 0
+    try:
+        supabase.table("training_tokens").upsert(
+            records, on_conflict="mint",
+        ).execute()
+        return len(records)
+    except Exception as e:
+        log.error("Supabase batch upsert failed: %s", e)
+        # Fall back to one-by-one
+        saved = 0
+        for record in records:
+            if save_to_supabase(record):
+                saved += 1
+        return saved
 
 
 # ===================================================================
@@ -141,7 +201,6 @@ def extract_mint_from_tx(tx: dict) -> str | None:
     for acct in tx.get("accountData", []):
         if acct.get("account") == PUMP_MIGRATION_PROGRAM:
             continue
-        # Native SOL mint is all-zeroes or a well-known constant
         raw = acct.get("raw", "")
         if raw and len(raw) > 32:
             return acct["account"]
@@ -163,17 +222,19 @@ def extract_mint_from_tx(tx: dict) -> str | None:
 
 
 # ===================================================================
-# DATA FETCHING
+# STEP 1: GET GRADUATED MINTS FROM HELIUS
 # ===================================================================
 
 
-def get_new_graduated_mints(
+def get_graduated_mints(
     before_sig: str | None = None,
     limit: int = 100,
 ) -> list[dict]:
     """
-    Fetch recently graduated pump.fun tokens from the Helius
-    migration-program address-transactions endpoint.
+    Fetches recently graduated pump.fun tokens
+    from the migration program transaction history.
+    No text search — raw program transactions only.
+    ~0.5 s delay between calls (2 req/s free tier).
     """
     url = (
         f"https://api.helius.xyz/v0/addresses/"
@@ -183,57 +244,167 @@ def get_new_graduated_mints(
     if before_sig:
         params["before"] = before_sig
 
-    result = _helius_get(url, params)
-    if isinstance(result, list):
-        return result
-    return []
+    def fetch():
+        r = requests.get(url, params=params, timeout=15)
+        if r.status_code == 429:
+            log.warning("Helius rate limited")
+            return None
+        r.raise_for_status()
+        return r.json()
+
+    result = with_retry(fetch)
+    time.sleep(0.5)  # 2 req/s limit
+    return result or []
 
 
-def get_token_asset(mint: str) -> dict:
-    """Get token metadata from Helius Digital Asset Standard API."""
-    resp = _helius_rpc("getAsset", {"id": mint})
-    if resp and "result" in resp:
-        return resp["result"]
-    return {}
+# ===================================================================
+# STEP 2: BATCH ASSET METADATA FROM HELIUS
+# ===================================================================
+
+
+def get_assets_batch(mints: list[str]) -> list[dict]:
+    """
+    Fetches token metadata for up to 100 mints.
+    Uses Helius DAS getAssets batch endpoint.
+    Much faster than individual getAsset calls.
+    ~0.5 s delay (2 req/s free tier).
+    """
+    if not mints:
+        return []
+
+    url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}"
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getAssetBatch",
+        "params": {
+            "ids": mints[:100],
+            "displayOptions": {"showFungible": True},
+        },
+    }
+
+    def fetch():
+        r = requests.post(url, json=payload, timeout=30)
+        if r.status_code == 429:
+            return None
+        r.raise_for_status()
+        return r.json().get("result", [])
+
+    result = with_retry(fetch)
+    time.sleep(0.5)
+    return result or []
+
+
+# ===================================================================
+# STEP 3: BATCH PRICE DATA FROM DEXSCREENER
+# ===================================================================
+
+
+def get_prices_batch(mints: list[str]) -> dict[str, dict]:
+    """
+    Fetches price + liquidity data for up to 30 mints.
+    DexScreener free tier: 300 req/min = 5 req/s.
+    No API key required.
+    Returns dict: mint → price_data.
+    ~0.2 s delay between calls (5 req/s).
+    """
+    if not mints:
+        return {}
+
+    # DexScreener accepts comma-separated addresses
+    ids = ",".join(mints[:30])
+    url = f"https://api.dexscreener.com/latest/dex/tokens/{ids}"
+
+    def fetch():
+        r = requests.get(url, timeout=15)
+        if r.status_code == 429:
+            return None
+        r.raise_for_status()
+        return r.json()
+
+    result = with_retry(fetch)
+    time.sleep(0.2)  # 5 req/s limit
+
+    if not result:
+        return {}
+
+    price_map: dict[str, dict] = {}
+    for pair in result.get("pairs", []) or []:
+        mint = pair.get("baseToken", {}).get("address", "")
+        if mint and mint not in price_map:
+            price_map[mint] = {
+                "price_usd": float(pair.get("priceUsd", 0) or 0),
+                "liquidity_usd": float(
+                    (pair.get("liquidity") or {}).get("usd", 0) or 0
+                ),
+                "volume_24h": float(
+                    (pair.get("volume") or {}).get("h24", 0) or 0
+                ),
+                "price_change_24h": float(
+                    (pair.get("priceChange") or {}).get("h24", 0) or 0
+                ),
+                "created_at": pair.get("pairCreatedAt", 0),
+            }
+    return price_map
+
+
+# ===================================================================
+# STEP 4: GET SWAP TRANSACTIONS FROM HELIUS
+# ===================================================================
 
 
 def get_token_swaps(
     mint: str,
-    from_ts: int,
-    to_ts: int,
+    graduation_ts: int,
 ) -> list[dict]:
     """
-    Get SWAP-type transactions for a token mint within a time window.
-    Uses Helius enhanced-transactions endpoint filtered by type=SWAP.
+    Gets swap transactions for sequence features.
+    Fetches first 100 swaps after graduation.
+    ~0.5 s delay (2 req/s).
     """
     url = f"https://api.helius.xyz/v0/addresses/{mint}/transactions"
-    params: dict = {"api-key": HELIUS_KEY, "limit": 100, "type": "SWAP"}
+    params: dict = {
+        "api-key": HELIUS_KEY,
+        "limit": 100,
+        "type": "SWAP",
+    }
 
-    result = _helius_get(url, params)
-    if not isinstance(result, list):
-        return []
+    def fetch():
+        r = requests.get(url, params=params, timeout=15)
+        if r.status_code == 429:
+            return None
+        r.raise_for_status()
+        txs = r.json()
+        # Filter to 72 h window after graduation
+        return [
+            tx
+            for tx in txs
+            if tx.get("timestamp", 0) >= graduation_ts
+            and tx.get("timestamp", 0) <= graduation_ts + 259200
+        ]
 
-    return [
-        tx for tx in result
-        if from_ts <= tx.get("timestamp", 0) <= to_ts
-    ]
+    result = with_retry(fetch)
+    time.sleep(0.5)
+    return result or []
 
 
 # ===================================================================
-# FEATURE ENGINEERING  (14 features)
+# STEP 5: COMPUTE FEATURES
 # ===================================================================
 
 
 def compute_features(
-    mint: str,
-    graduation_ts: int,
     asset: dict,
     swaps: list[dict],
+    graduation_ts: int,
 ) -> tuple[dict, list[list]]:
-    """Compute 14 normalised features and a 16-row temporal sequence."""
+    """
+    Computes all 14 tabular features and a [16, 6] sequence
+    from raw on-chain data.  No Rugcheck dependency.
+    """
     features: dict = {}
 
-    # ---- authority features (from DAS asset) ----
+    # ---- Authority features (from DAS asset) ----
     authorities = asset.get("authorities", [])
     features["mint_authority_active"] = float(
         any("mint" in a.get("scopes", []) for a in authorities)
@@ -243,91 +414,107 @@ def compute_features(
     )
     features["mutable_metadata"] = float(asset.get("mutable", True))
 
-    # ---- default liquidity features ----
-    features["lp_burn_pct"] = 0.9
-    features["initial_liquidity_sol"] = 0.0
-    features["liquidity_concentration"] = 0.0
-    features["dev_hold_pct"] = 0.0
-    features["top10_holder_pct"] = 0.0
-    features["bundle_wallet_count"] = 0.0
-    features["migration_speed_seconds"] = 0.5
+    # ---- Default values ----
+    features.update({
+        "lp_burn_pct": 0.9,
+        "initial_liquidity_sol": 0.0,
+        "liquidity_concentration": 0.0,
+        "dev_hold_pct": 0.0,
+        "top10_holder_pct": 0.0,
+        "bundle_wallet_count": 0.0,
+        "migration_speed_seconds": 0.5,
+        "buy_sell_ratio_60s": 0.5,
+        "price_velocity_60s": 0.0,
+        "unique_buyers_60s": 0.0,
+        "avg_transaction_size_sol": 0.0,
+    })
 
     if not swaps:
-        features["buy_sell_ratio_60s"] = 0.5
-        features["price_velocity_60s"] = 0.0
-        features["unique_buyers_60s"] = 0.0
-        features["avg_transaction_size_sol"] = 0.0
         return features, []
 
-    # ---- first-swap liquidity ----
-    first = swaps[0]
-    swap_ev = first.get("events", {}).get("swap", {})
-    native_in = (swap_ev.get("nativeInput") or {}).get("amount", 0)
-    pool_sol = abs(native_in) / 1e9 if native_in else 0.0
+    # ---- Initial liquidity from first swap ----
+    first_ev = swaps[0].get("events", {}).get("swap", {})
+    native_in = (first_ev.get("nativeInput") or {}).get("amount", 0) or 0
+    pool_sol = abs(native_in) / 1e9
     features["initial_liquidity_sol"] = min(pool_sol / 1000, 1.0)
 
-    # ---- 60-second window metrics ----
-    swaps_60s = [s for s in swaps if s.get("timestamp", 0) <= graduation_ts + 60]
+    # ---- First 60 seconds behavior ----
+    swaps_60s = [
+        s for s in swaps
+        if graduation_ts <= s.get("timestamp", 0) <= graduation_ts + 60
+    ]
 
-    buyers: set[str] = set()
-    buy_vol = sell_vol = 0.0
-    prices: list[float] = []
+    if swaps_60s:
+        buyers: set[str] = set()
+        buy_vol = sell_vol = 0.0
+        prices: list[float] = []
+
+        for swap in swaps_60s:
+            ev = swap.get("events", {}).get("swap", {})
+            signer = swap.get("feePayer", "")
+            nat_in = (ev.get("nativeInput") or {})
+            nat_out = (ev.get("nativeOutput") or {})
+            tok_out = ev.get("tokenOutputs", [{}])
+
+            sol_in = nat_in.get("amount", 0) / 1e9
+
+            if nat_in.get("amount", 0):
+                buyers.add(signer)
+                buy_vol += nat_in["amount"]
+            if nat_out.get("amount", 0):
+                sell_vol += nat_out["amount"]
+
+            tok_amt = float(tok_out[0].get("tokenAmount", 0)) if tok_out else 0
+            if tok_amt > 0:
+                prices.append(sol_in / tok_amt)
+
+        # Aggregate metrics
+        total_vol = buy_vol + sell_vol
+        features["buy_sell_ratio_60s"] = (
+            (buy_vol / total_vol) if total_vol > 0 else 0.5
+        )
+        features["unique_buyers_60s"] = min(len(buyers) / 100, 1.0)
+
+        if len(prices) >= 2 and prices[0] > 0:
+            change = (prices[-1] - prices[0]) / prices[0]
+            features["price_velocity_60s"] = max(min(change, 1.0), -1.0)
+
+        avg_swap = ((buy_vol / len(buyers)) / 1e9) if buyers else 0.0
+        features["avg_transaction_size_sol"] = min(avg_swap / 10, 1.0)
+
+    # ---- Build [16, 6] temporal sequence ----
     sequence: list[list] = []
+    seq_buyers: set[str] = set()
+    seq_buy_vol = seq_sell_vol = 0.0
 
-    for i, swap in enumerate(swaps):
+    for i, swap in enumerate(swaps[:SEQUENCE_LENGTH]):
         ev = swap.get("events", {}).get("swap", {})
         signer = swap.get("feePayer", "")
         nat_in = (ev.get("nativeInput") or {}).get("amount", 0) or 0
         nat_out = (ev.get("nativeOutput") or {}).get("amount", 0) or 0
-        tok_out = ev.get("tokenOutputs", [{}])
 
-        # Price per token  (SOL spent ÷ tokens received)
         sol_in = nat_in / 1e9
-        tok_amt = float(tok_out[0].get("tokenAmount", 0)) if tok_out else 0
-        price = (sol_in / tok_amt) if tok_amt > 0 else 0.0
-
         if nat_in:
-            buyers.add(signer)
-            buy_vol += nat_in
+            seq_buyers.add(signer)
+            seq_buy_vol += nat_in
         if nat_out:
-            sell_vol += nat_out
+            seq_sell_vol += nat_out
 
-        if price > 0:
-            prices.append(price)
+        total_nat = seq_buy_vol + seq_sell_vol
+        sequence.append([
+            len(seq_buyers),                            # holders (cumulative buyers)
+            pool_sol,                                   # liquidity
+            total_nat / 1e9,                            # volume
+            (seq_buy_vol / total_nat) if total_nat > 0 else 0.5,  # buy ratio
+            sol_in,                                     # velocity
+            i + 1,                                      # tx_count
+        ])
 
-        # Build 16-row sequence (padded)
-        if i < 16:
-            total_nat = buy_vol + sell_vol
-            sequence.append([
-                len(buyers),                              # holders (cumulative buyers)
-                pool_sol,                                 # liquidity
-                total_nat / 1e9,                          # volume
-                (buy_vol / total_nat) if total_nat > 0 else 0.5,  # buy ratio
-                sol_in,                                   # velocity
-                i + 1,                                    # tx_count
-            ])
-
-    # Pad sequence to exactly 16 rows
-    while len(sequence) < 16:
+    # Pad sequence to exactly [16, 6]
+    while len(sequence) < SEQUENCE_LENGTH:
         sequence.append([0, 0, 0, 0.5, 0, 0])
 
-    # ---- aggregate metrics ----
-    total_vol = buy_vol + sell_vol
-    features["buy_sell_ratio_60s"] = (
-        (buy_vol / total_vol) if total_vol > 0 else 0.5
-    )
-    features["unique_buyers_60s"] = min(len(buyers) / 100, 1.0)
-
-    if len(prices) >= 2 and prices[0] > 0:
-        change = (prices[-1] - prices[0]) / prices[0]
-        features["price_velocity_60s"] = max(min(change, 1.0), -1.0)
-    else:
-        features["price_velocity_60s"] = 0.0
-
-    avg_swap = ((buy_vol / len(buyers)) / 1e9) if buyers else 0.0
-    features["avg_transaction_size_sol"] = min(avg_swap / 10, 1.0)
-
-    return features, sequence[:16]
+    return features, sequence[:SEQUENCE_LENGTH]
 
 
 # ===================================================================
@@ -335,92 +522,33 @@ def compute_features(
 # ===================================================================
 
 
-def compute_labels(
-    swaps: list[dict],
+def compute_labels_dexscreener(
+    price_data: dict,
     graduation_ts: int,
-) -> dict | None:
+) -> dict:
     """
-    Compute rug-detection labels from 72-hour post-graduation swap history.
-
-    Returns dict with:
-      rug_label         0 | 1
-      time_to_rug_hours float (≤72)
-      max_drawdown_pct  float
-      pump_2x_label     0 | 1
+    Compute rug-detection labels from DexScreener price data.
+    Uses priceChange.h24 and liquidity to infer rug outcome
+    without needing 72 h of raw swap data.
     """
-    if not swaps:
-        return None
+    price_change_24h = price_data.get("price_change_24h", 0)
+    liquidity_usd = price_data.get("liquidity_usd", 0)
 
-    # Aggregate hourly prices
-    prices_by_hour: dict[int, list[float]] = {}
-    for swap in swaps:
-        ts = swap.get("timestamp", 0)
-        hour = int((ts - graduation_ts) / 3600)
-        if not (0 <= hour <= 72):
-            continue
+    # Simple rug detection from price change
+    max_drawdown = max(0.0, -price_change_24h)
 
-        ev = swap.get("events", {}).get("swap", {})
-        nat_in = (ev.get("nativeInput") or {}).get("amount", 0)
-        tok_out = ev.get("tokenOutputs", [{}])
-        sol = nat_in / 1e9
-        tok = float(tok_out[0].get("tokenAmount", 0)) if tok_out else 0
-
-        if tok > 0 and sol > 0:
-            prices_by_hour.setdefault(hour, []).append(sol / tok)
-
-    if not prices_by_hour:
-        return None
-
-    hours = sorted(prices_by_hour.keys())
-    prices = [sum(prices_by_hour[h]) / len(prices_by_hour[h]) for h in hours]
-
-    if len(prices) < 2:
-        return None
-
-    entry = prices[0]
-    peak = max(prices)
-    low = min(prices)
-
-    max_dd = ((peak - low) / peak * 100) if peak > 0 else 0.0
-    pump_2x = 1 if peak >= entry * 2 else 0
-
-    # Rug detection: ≥80 % drawdown from running peak
-    rug = 0
-    rug_time = 72.0
-    running_peak = entry
-
-    for i, p in enumerate(prices):
-        running_peak = max(running_peak, p)
-        if running_peak > 0:
-            dd = (running_peak - p) / running_peak * 100
-            if dd >= 80:
-                rug = 1
-                rug_time = float(hours[i])
-                break
+    rug_label = 1 if (
+        price_change_24h < -80 or
+        liquidity_usd < 100  # LP essentially gone
+    ) else 0
 
     return {
-        "rug_label": rug,
-        "time_to_rug_hours": rug_time,
-        "max_drawdown_pct": max_dd,
-        "pump_2x_label": pump_2x,
+        "rug_label": rug_label,
+        "time_to_rug_hours": 12.0 if rug_label else 72.0,
+        "max_drawdown_pct": max_drawdown,
+        "pump_2x_label": 1 if price_change_24h > 100 else 0,
+        "inferred_label": True,
     }
-
-
-# ===================================================================
-# PERSISTENCE
-# ===================================================================
-
-
-def save_to_supabase(record: dict) -> bool:
-    """Upsert a token record into the training_tokens table."""
-    try:
-        supabase.table("training_tokens").upsert(
-            record, on_conflict="mint",
-        ).execute()
-        return True
-    except Exception as e:
-        log.error("Supabase upsert failed for %s: %s", record.get("mint", "?"), e)
-        return False
 
 
 # ===================================================================
@@ -428,26 +556,25 @@ def save_to_supabase(record: dict) -> bool:
 # ===================================================================
 
 
-def process_token(mint: str, graduation_ts: int, tx_signature: str) -> bool:
-    """Full pipeline: fetch data → compute features & labels → save."""
-    log.info("Processing %s...", mint[:12])
+def build_record(
+    mint: str,
+    graduation_ts: int,
+    tx_signature: str,
+    asset: dict,
+    swaps: list[dict],
+    price_data: dict | None,
+) -> dict:
+    """Build a single token record from all data sources."""
+    features, sequence = compute_features(asset, swaps, graduation_ts)
 
-    # 1. Get DAS asset metadata
-    asset = get_token_asset(mint)
-    time.sleep(0.3)
+    # Compress sequence using float16 base64
+    sequence_b64 = compress_sequence(sequence) if sequence else zero_sequence()
 
-    # 2. Get 72-hour swap history  (259 200 seconds)
-    swaps = get_token_swaps(mint, graduation_ts, graduation_ts + 259200)
-    time.sleep(0.3)
-
-    # 3. Compute features + temporal sequence
-    features, sequence = compute_features(mint, graduation_ts, asset, swaps)
-
-    # 4. Compute labels
-    labels = compute_labels(swaps, graduation_ts)
-    inferred = False
-    if labels is None:
-        # Infer labels from authority features when no price data exists
+    # Labels from DexScreener
+    if price_data:
+        labels = compute_labels_dexscreener(price_data, graduation_ts)
+    else:
+        # Fallback: infer labels from authority features
         high_risk = (
             features.get("mint_authority_active", 0)
             + features.get("freeze_authority_active", 0)
@@ -457,24 +584,95 @@ def process_token(mint: str, graduation_ts: int, tx_signature: str) -> bool:
             "time_to_rug_hours": 24.0 if high_risk > 0 else 72.0,
             "max_drawdown_pct": 90.0 if high_risk > 0 else 20.0,
             "pump_2x_label": 0,
+            "inferred_label": True,
         }
-        inferred = True
 
-    # 5. Build record
     record = {
         "mint": mint,
         "graduation_timestamp": graduation_ts,
-        "tx_signature": tx_signature,
         "collected_at": datetime.now(timezone.utc).isoformat(),
         **features,
-        "sequence": json.dumps(sequence),
+        "sequence_b64": sequence_b64,
         "has_sequence": len(swaps) > 0,
         **labels,
-        "inferred_label": inferred,
         "deployer_address": asset.get("ownership", {}).get("owner", ""),
     }
 
-    return save_to_supabase(record)
+    # Attach DexScreener metadata columns when available
+    if price_data:
+        record["price_usd"] = price_data.get("price_usd", 0)
+        record["liquidity_usd"] = price_data.get("liquidity_usd", 0)
+        record["volume_24h"] = price_data.get("volume_24h", 0)
+        record["price_change_24h"] = price_data.get("price_change_24h", 0)
+
+    return record
+
+
+def process_batch(
+    tokens: list[tuple[str, int, str]],
+    total_collected: int,
+    start_time: float,
+) -> tuple[int, float]:
+    """
+    Process a batch of new tokens through the full pipeline:
+      1. Helius getAssetBatch  (100 tokens × 2 req/s)
+      2. DexScreener price batch (30 tokens × 5 req/s)
+      3. Per-token swap fetch     (individual × 2 req/s)
+      4. Build records + save to Supabase
+
+    Returns (new_tokens_saved, tokens_per_second).
+    """
+    if not tokens:
+        return 0, 0.0
+
+    mints = [t[0] for t in tokens]
+    new_count = 0
+
+    # ── Phase 1: Helius DAS assets (batches of 100) ──
+    asset_map: dict[str, dict] = {}
+    for i in range(0, len(mints), 100):
+        chunk = mints[i : i + 100]
+        batch_result = get_assets_batch(chunk)
+        for item in batch_result:
+            if isinstance(item, dict) and "id" in item:
+                asset_map[item["id"]] = item
+        log.info("  Assets: %d/%d fetched", len(asset_map), len(mints))
+        if i + 100 < len(mints):
+            time.sleep(0.5)  # 2 req/s limit
+
+    # ── Phase 2: DexScreener prices (batches of 30) ──
+    price_map: dict[str, dict] = {}
+    for i in range(0, len(mints), 30):
+        chunk = mints[i : i + 30]
+        batch_result = get_prices_batch(chunk)
+        price_map.update(batch_result)
+        if i + 30 < len(mints):
+            time.sleep(0.2)  # 5 req/s limit
+
+    log.info("  Prices: %d/%d tokens have DexScreener data",
+             len(price_map), len(mints))
+
+    # ── Phase 3: Per-token swaps + build records ──
+    records: list[dict] = []
+    for mint, graduation_ts, tx_sig in tokens:
+        asset = asset_map.get(mint, {})
+        price_data = price_map.get(mint)
+
+        # Fetch swap transactions (per-token, 2 req/s)
+        swaps = get_token_swaps(mint, graduation_ts)
+
+        record = build_record(mint, graduation_ts, tx_sig, asset, swaps, price_data)
+        records.append(record)
+
+    # ── Phase 4: Save to Supabase ──
+    saved = save_batch(records)
+    new_count += saved
+
+    # ── Throughput ──
+    elapsed = time.time() - start_time
+    tps = (total_collected + saved) / elapsed if elapsed > 0 else 0.0
+
+    return new_count, tps
 
 
 # ===================================================================
@@ -513,9 +711,13 @@ def main() -> None:
     log.info("Helius key  : %s", "SET" if HELIUS_KEY else "MISSING")
     log.info("Supabase URL: %s", "SET" if SUPABASE_URL else "MISSING")
     log.info("Interval    : %ds", INTERVAL)
+    log.info("Batch sizes : Helius=100, DexScreener=30")
+    log.info("Sequence    : float16 base64 (~256 B/row)")
 
     # ---- Start keep-alive HTTP server in background ----
-    keepalive_thread = Thread(target=start_keepalive_server, args=(KEEPALIVE_PORT,), daemon=True)
+    keepalive_thread = Thread(
+        target=start_keepalive_server, args=(KEEPALIVE_PORT,), daemon=True,
+    )
     keepalive_thread.start()
     time.sleep(0.5)
 
@@ -526,14 +728,16 @@ def main() -> None:
     before_sig: str | None = None
     total_collected = len(existing)
     cycle = 0
+    start_time = time.time()
+    last_throughput_log = total_collected
 
     while True:
         try:
             cycle += 1
             log.info("--- Cycle %d ---", cycle)
 
-            # Fetch new graduated-mint transactions
-            txs = get_new_graduated_mints(before_sig)
+            # Fetch new graduated-mint transactions  (STEP 1)
+            txs = get_graduated_mints(before_sig)
 
             if not txs:
                 log.info("No new transactions returned — "
@@ -543,27 +747,51 @@ def main() -> None:
 
             log.info("Got %d transactions from Helius", len(txs))
 
-            new_count = 0
+            # Collect new (unseen) tokens for batch processing
+            new_tokens: list[tuple[str, int, str]] = []
             for tx in txs:
                 mint = extract_mint_from_tx(tx)
-                if not mint:
+                if not mint or mint in existing:
                     continue
-                if mint in existing:
-                    continue
-
                 sig = tx.get("signature", "")
                 ts = tx.get("timestamp", 0)
+                new_tokens.append((mint, ts, sig))
+                existing.add(mint)  # mark seen immediately
 
-                if process_token(mint, ts, sig):
-                    existing.add(mint)
-                    new_count += 1
-                    total_collected += 1
+            if not new_tokens:
+                log.info("All %d tx already collected — "
+                         "sleeping %ds", len(txs), INTERVAL)
+                # Update pagination cursor
+                if txs:
+                    before_sig = txs[-1].get("signature", before_sig)
+                time.sleep(INTERVAL)
+                continue
 
-                # Small delay between tokens to respect rate limits
-                time.sleep(0.8)
+            log.info("%d new tokens to process in batch", len(new_tokens))
+
+            # Process the batch  (STEPS 2–5)
+            new_count, tps = process_batch(
+                new_tokens, total_collected, start_time,
+            )
+            total_collected += new_count
 
             log.info("Cycle %d done: +%d new  (total: %d)",
                      cycle, new_count, total_collected)
+
+            # ---- Throughput logging every 1000 tokens ----
+            if total_collected - last_throughput_log >= 1000:
+                last_throughput_log = total_collected
+                elapsed_hrs = (time.time() - start_time) / 3600
+                eta_1M = (
+                    (1_000_000 - total_collected) / max(tps, 0.01) / 3600
+                )
+                log.info(
+                    "Throughput: %.1f tok/s | "
+                    "Total: %d | "
+                    "Uptime: %.1fh | "
+                    "ETA 1M: %.1fh",
+                    tps, total_collected, elapsed_hrs, eta_1M,
+                )
 
             # Update pagination cursor to the oldest tx in this batch
             if txs:
