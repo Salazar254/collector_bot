@@ -42,57 +42,66 @@ def parse_swap(tx: dict, token_mint: str = "") -> dict:
     """
     Parse a Helius enhanced swap transaction into a normalized dict.
 
-    Uses multi-strategy direction detection:
-      1. nativeInput.amount > 0 → buy
-      2. nativeOutput.amount > 0 → sell
-      3. tokenTransfers: fee-payer receives token_mint → buy, sends → sell
-      4. Fallback: assume buy (most post-graduation swaps are buys)
+    Direction detection (priority order):
+      1. tokenTransfers: fee-payer receives token_mint → buy, sends → sell
+      2. nativeTransfers:  fee-payer sends SOL → buy, receives SOL → sell
+      3. nativeInput.amount > 0 → buy
+      4. nativeOutput.amount > 0 → sell
+      5. Fallback: assume buy (most post-graduation swaps are buys)
+
+    SOL amount: nativeTransfers > nativeInput/nativeOutput max
 
     Returns dict with:
         timestamp, fee_payer, is_buy, sol_amount, usd_estimate
     """
+    fee_payer = tx.get("feePayer", "")
     ev = tx.get("events", {}).get("swap", {}) or {}
     native_in = ev.get("nativeInput") or {}
     native_out = ev.get("nativeOutput") or {}
 
     in_amt = _safe_int(native_in.get("amount", 0))
     out_amt = _safe_int(native_out.get("amount", 0))
-    sol_amount = max(in_amt, out_amt) / 1e9 if (in_amt or out_amt) else 0.0
 
-    # Strategy 1 & 2: nativeInput / nativeOutput
-    if in_amt > 0:
-        is_buy = True
-        usd_info = native_in
-    elif out_amt > 0:
-        is_buy = False
-        usd_info = native_out
-    else:
-        # Strategy 3: tokenTransfers fallback
-        fee_payer = tx.get("feePayer", "")
-        is_buy = _detect_direction_from_transfers(tx, token_mint, fee_payer)
-        usd_info = {}
+    # ── Priority 1: tokenTransfers (most reliable for Raydium) ──
+    is_buy = _detect_direction_from_token_transfers(tx, token_mint, fee_payer)
 
-        # Strategy 4: log + assume buy for newly graduated tokens
-        if is_buy is None:
-            log.debug("Swap direction undetermined for %s — assuming buy",
-                      tx.get("signature", "?")[:12])
+    # ── Priority 2: nativeTransfers (SOL movement) ──
+    if is_buy is None:
+        is_buy = _detect_direction_from_native_transfers(tx, fee_payer)
+
+    # ── Priority 3+4: nativeInput / nativeOutput ──
+    if is_buy is None:
+        if in_amt > 0:
             is_buy = True
+        elif out_amt > 0:
+            is_buy = False
 
-    # SOL price estimate
-    sol_price_usd = float(usd_info.get("usdPrice", 0) or 0) if usd_info else 0.0
-    if sol_price_usd <= 0:
-        sol_price_usd = 150.0
+    # ── Priority 5: assume buy ──
+    if is_buy is None:
+        is_buy = True
+
+    # ── SOL amount: nativeTransfers is the ground truth ──
+    sol_amount = _extract_sol_amount_from_native_transfers(tx, fee_payer)
+    if sol_amount <= 0:
+        sol_amount = max(in_amt, out_amt) / 1e9
+
+    # ── USD estimate ──
+    sol_price_usd = 150.0
+    if is_buy and native_in:
+        sol_price_usd = float(native_in.get("usdPrice", 0) or 0) or 150.0
+    elif not is_buy and native_out:
+        sol_price_usd = float(native_out.get("usdPrice", 0) or 0) or 150.0
 
     return {
         "timestamp": tx.get("timestamp", 0),
-        "fee_payer": tx.get("feePayer", ""),
+        "fee_payer": fee_payer,
         "is_buy": is_buy,
         "sol_amount": sol_amount,
         "usd_estimate": round(sol_amount * sol_price_usd, 2),
     }
 
 
-def _detect_direction_from_transfers(tx: dict, token_mint: str, fee_payer: str) -> Optional[bool]:
+def _detect_direction_from_token_transfers(tx: dict, token_mint: str, fee_payer: str) -> Optional[bool]:
     """
     Determine swap direction from tokenTransfers array.
 
@@ -116,7 +125,19 @@ def _detect_direction_from_transfers(tx: dict, token_mint: str, fee_payer: str) 
         if from_user == fee_payer:
             return False  # fee payer sent tokens → sell
 
-    # Also check nativeTransfers as fallback
+    return None
+
+
+def _detect_direction_from_native_transfers(tx: dict, fee_payer: str) -> Optional[bool]:
+    """
+    Determine swap direction from nativeTransfers (SOL movement).
+
+    Fee payer sends SOL → buy (True)
+    Fee payer receives SOL → sell (False)
+    """
+    if not fee_payer:
+        return None
+
     for nt in tx.get("nativeTransfers", []):
         amt = _safe_int(nt.get("amount", 0))
         if amt <= 0:
@@ -127,6 +148,26 @@ def _detect_direction_from_transfers(tx: dict, token_mint: str, fee_payer: str) 
             return False  # fee payer received SOL → sell
 
     return None
+
+
+def _extract_sol_amount_from_native_transfers(tx: dict, fee_payer: str) -> float:
+    """
+    Extract the SOL amount involved in this swap from nativeTransfers.
+    Returns the max SOL amount sent/received by the fee payer, in SOL units.
+    """
+    if not fee_payer:
+        return 0.0
+
+    max_lamports = 0
+    for nt in tx.get("nativeTransfers", []):
+        from_user = nt.get("fromUserAccount", "")
+        to_user = nt.get("toUserAccount", "")
+        if from_user == fee_payer or to_user == fee_payer:
+            amt = _safe_int(nt.get("amount", 0))
+            if amt > max_lamports:
+                max_lamports = amt
+
+    return max_lamports / 1e9
 
 
 def parse_swaps_for_window(swaps: list[dict], window_start: int, window_end: int, token_mint: str = "") -> list[dict]:
