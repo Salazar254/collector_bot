@@ -107,6 +107,15 @@ PUMP_MIGRATION_PROGRAM = (
     "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg"
 )
 
+# Well-known non-pump.fun mints — skip these to avoid collecting
+# wrapped-SOL, stablecoins, and system accounts as "tokens"
+SKIP_MINTS: frozenset[str] = frozenset({
+    "So11111111111111111111111111111111111111112",   # Wrapped SOL
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+    "11111111111111111111111111111111",               # Native SOL (system program)
+})
+
 # ---------------------------------------------------------------------------
 # Supabase client
 # ---------------------------------------------------------------------------
@@ -184,22 +193,29 @@ def save_batch(records: list[dict]) -> int:
 # ===================================================================
 
 
+def _is_valid_mint(mint: str) -> bool:
+    """Return False for known non-pump.fun mints (WSOL, USDC, etc.)."""
+    return mint not in SKIP_MINTS and mint != PUMP_MIGRATION_PROGRAM
+
+
 def extract_mint_from_tx(tx: dict) -> str | None:
     """
     Extract the token mint address from a Helius enhanced transaction.
 
     Pump.fun migration transactions contain token-balance changes or
     token-transfers that reveal the mint being migrated to Raydium.
+
+    Filters out well-known non-pump.fun mints (WSOL, USDC, USDT, etc.).
     """
     # Strategy 1 — tokenTransfers array (Helius enhanced)
     for transfer in tx.get("tokenTransfers", []):
         mint = transfer.get("mint")
-        if mint and mint != PUMP_MIGRATION_PROGRAM:
+        if mint and _is_valid_mint(mint):
             return mint
 
     # Strategy 2 — accountData (Helius enhanced)
     for acct in tx.get("accountData", []):
-        if acct.get("account") == PUMP_MIGRATION_PROGRAM:
+        if not _is_valid_mint(acct.get("account", "")):
             continue
         raw = acct.get("raw", "")
         if raw and len(raw) > 32:
@@ -208,14 +224,14 @@ def extract_mint_from_tx(tx: dict) -> str | None:
     # Strategy 3 — tokenBalanceChanges
     for change in tx.get("tokenBalanceChanges", []):
         mint = change.get("mint")
-        if mint and mint != PUMP_MIGRATION_PROGRAM:
+        if mint and _is_valid_mint(mint):
             return mint
 
     # Strategy 4 — logMessages parsing (fallback)
     for msg in tx.get("logMessages", []):
         if "mint" in msg.lower() or "token" in msg.lower():
             for word in msg.split():
-                if len(word) >= 43 and len(word) <= 45:
+                if len(word) >= 43 and len(word) <= 45 and _is_valid_mint(word):
                     return word
 
     return None

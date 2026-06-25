@@ -53,3 +53,12 @@ CREATE INDEX IF NOT EXISTS idx_rug_label
   ON training_tokens(rug_label);
 CREATE INDEX IF NOT EXISTS idx_collected_at
   ON training_tokens(collected_at);
+
+-- Allow the service role to insert/update (RLS is on by default)
+ALTER TABLE training_tokens ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS rls_allow_all ON training_tokens;
+CREATE POLICY rls_allow_all ON training_tokens
+  FOR ALL
+  USING (true)
+  WITH CHECK (true);
