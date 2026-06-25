@@ -1,40 +1,6 @@
-# ─── Solana HFT Meme-Coin Sniping Bot ───
-# Core
-solana>=0.32.0
-solders>=0.21.0
-websockets>=12.0
-httpx>=0.27.0
-
-# Data
-pandas>=2.2.0
-numpy>=1.26.0
-
-# Data Collection Service (scripts/collect_service.py)
+# ─── collector_bot — Pump.fun token data collection service ───
+# Data collection
 supabase>=2.0.0
 requests>=2.31.0
-
-# ML - PyTorch
-torch>=2.2.0
-torchvision>=0.17.0
-
-# ML - Gradient Boosting
-xgboost>=2.0.0
-scikit-learn>=1.4.0
-skl2onnx>=1.16.0
-onnxmltools>=1.11.0
-onnxruntime>=1.17.0
-
-# Visualization
-matplotlib>=3.8.0
-seaborn>=0.13.0
-notebook>=7.0.0
-ipykernel>=6.29.0
-
-# Config / Utils
+numpy>=1.26.0
 python-dotenv>=1.0.0
-toml>=0.10.2
-rich>=13.7.0
-click>=8.1.0
-
-# Testing
-pytest>=8.0.0
