@@ -1,4 +1,5 @@
-# render.yaml — Render Blueprint for collector_bot
+# render.yaml — Render Blueprint for collector_bot v2
+# Snapshot-based data collection at T0, T0+1m, T0+5m, T0+15m.
 # Auto-deploys on git push to main branch.
 
 services:
@@ -8,7 +9,7 @@ services:
     region: oregon
     plan: free
     buildCommand: pip install -r requirements.lock
-    startCommand: python scripts/collect_service.py --backfill
+    startCommand: python scripts/collect_service.py
     envVars:
       - key: HELIUS_API_KEY
         sync: false
@@ -17,8 +18,8 @@ services:
       - key: SUPABASE_KEY
         sync: false
       - key: COLLECTION_INTERVAL_SECONDS
-        value: "30"
+        value: "10"
+      - key: QUALITY_CHECK_INTERVAL
+        value: "100"
       - key: PORT
-        value: "8080"
-      - key: BACKFILL
-        value: "true"
+        value: "10000"

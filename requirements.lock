@@ -1,5 +1,6 @@
-# ─── collector_bot — pinned dependencies for deterministic Render builds ───
+# ─── collector_bot v2 — pinned dependencies for deterministic Render builds ───
 # Generated 2025-06-25 — bump versions as needed.
+# v2 snapshot-based collector: no new deps beyond v1 core set.
 
 supabase==2.7.1
 requests==2.32.3

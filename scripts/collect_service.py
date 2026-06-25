@@ -1,19 +1,27 @@
 """
-scripts/collect_service.py — Standalone data collection service.
+scripts/collect_service.py — Snapshot-based pump.fun token data collection service.
 
 Runs as a long-running Python service on Render.com free tier.
-Continuously collects graduated pump.fun token data from
-Helius + DexScreener and saves to Supabase free tier.
+Detects pump.fun graduations and collects time-series snapshots at
+T0, T0+1m, T0+5m, T0+15m with 50 post-migration trading features.
 
-KEY CONSTRAINT: Supabase free tier = 500 MB limit.
-Sequence data is stored as compressed float16 base64
-to fit 1M rows within 500 MB.
+DATA SOURCES:
+  - Helius API    (migration detection, swap transactions, DAS metadata)
+  - DexScreener   (price, liquidity)
+
+COLLECTION STRATEGY:
+  When a token graduates (T0 = migration detected):
+    T0+1m   →  DexScreener price + Helius swaps [T0, T0+60s]
+    T0+5m   →  DexScreener price + Helius swaps [T0, T0+300s]
+    T0+15m  →  DexScreener price + Helius swaps [T0, T0+900s]
+                →  compute all features → save to Supabase
 
 ENVIRONMENT VARIABLES (set in Render dashboard):
   HELIUS_API_KEY=
   SUPABASE_URL=
   SUPABASE_KEY=
-  COLLECTION_INTERVAL_SECONDS=30
+  COLLECTION_INTERVAL_SECONDS=10
+  QUALITY_CHECK_INTERVAL=100
   PORT=8080
 """
 
@@ -24,13 +32,15 @@ import sys
 import argparse
 import logging
 import requests
-import numpy as np
-import base64
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from threading import Thread
+from threading import Thread, Lock
+from typing import Optional
 
 from supabase import create_client, Client
+
+from features import compute_all_features, parse_swaps_for_window
+from quality_validator import QualityValidator, run_quality_check
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -43,62 +53,13 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Sequence compression utilities  (PART 2)
-# ---------------------------------------------------------------------------
-
-SEQUENCE_LENGTH = 16
-SEQUENCE_FEATURES = 6
-# Feature order must match src/features/sequence_buffer.ts
-# [holders, liquidity, volume, ratio, velocity, tx_count]
-
-
-def compress_sequence(sequence: list) -> str:
-    """
-    Converts [16, 6] float list to compressed base64.
-    Uses float16 (half precision) — sufficient for
-    training, 3x smaller than float32 JSONB.
-
-    Size: 16 × 6 × 2 bytes = 192 bytes raw
-          × 4/3 base64 overhead = ~256 bytes as TEXT
-    """
-    arr = np.array(sequence, dtype=np.float16)
-    if arr.shape != (SEQUENCE_LENGTH, SEQUENCE_FEATURES):
-        # Pad or truncate to correct shape
-        padded = np.zeros(
-            (SEQUENCE_LENGTH, SEQUENCE_FEATURES),
-            dtype=np.float16,
-        )
-        rows = min(len(sequence), SEQUENCE_LENGTH)
-        padded[:rows] = arr[:rows]
-        arr = padded
-    return base64.b64encode(arr.tobytes()).decode("utf-8")
-
-
-def decompress_sequence(b64_str: str) -> np.ndarray:
-    """
-    Converts compressed base64 back to [16, 6] float32.
-    Called during Colab training data loading.
-    Returns float32 for PyTorch compatibility.
-    """
-    raw = base64.b64decode(b64_str)
-    arr = np.frombuffer(raw, dtype=np.float16)
-    return arr.reshape(SEQUENCE_LENGTH, SEQUENCE_FEATURES).astype(np.float32)
-
-
-def zero_sequence() -> str:
-    """Returns a compressed all-zero sequence."""
-    return compress_sequence(
-        [[0.0] * SEQUENCE_FEATURES for _ in range(SEQUENCE_LENGTH)]
-    )
-
-
-# ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
 HELIUS_KEY = os.environ["HELIUS_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-INTERVAL = int(os.environ.get("COLLECTION_INTERVAL_SECONDS", "30"))
+INTERVAL = int(os.environ.get("COLLECTION_INTERVAL_SECONDS", "10"))
+QUALITY_CHECK_INTERVAL = int(os.environ.get("QUALITY_CHECK_INTERVAL", "100"))
 KEEPALIVE_PORT = int(os.environ.get("PORT", "8080"))
 
 # ---------------------------------------------------------------------------
@@ -108,19 +69,141 @@ PUMP_MIGRATION_PROGRAM = (
     "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg"
 )
 
-# Well-known non-pump.fun mints — skip these to avoid collecting
-# wrapped-SOL, stablecoins, and system accounts as "tokens"
 SKIP_MINTS: frozenset[str] = frozenset({
     "So11111111111111111111111111111111111111112",   # Wrapped SOL
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
-    "11111111111111111111111111111111",               # Native SOL (system program)
+    "11111111111111111111111111111111",               # Native SOL
 })
+
+SNAPSHOT_WINDOWS = {
+    "t1m": 60,
+    "t5m": 300,
+    "t15m": 900,
+}
+
+# Maps scheduler window labels → features.py window keys
+WINDOW_KEY_MAP = {"t1m": "1m", "t5m": "5m", "t15m": "15m"}
 
 # ---------------------------------------------------------------------------
 # Supabase client
 # ---------------------------------------------------------------------------
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+# ===================================================================
+# SNAPSHOT SCHEDULER
+# ===================================================================
+
+
+class SnapshotScheduler:
+    """
+    In-memory scheduler tracking tokens from T0 detection through
+    T0+1m, T0+5m, T0+15m snapshot collection.
+
+    State machine: pending → collecting → complete
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        # {mint: {"t0": ts, "symbol": str, "tx_sig": str,
+        #         "snapshots": {"t0": {...}, "t1m": {...}, ...},
+        #         "state": "pending"|"collecting"|"complete",
+        #         "created_at": float}}
+        self._tokens: dict[str, dict] = {}
+
+    def schedule(self, mint: str, t0_ts: int, tx_sig: str, symbol: str = "") -> None:
+        """Register a newly detected migration for snapshot tracking."""
+        with self._lock:
+            if mint in self._tokens:
+                return
+            self._tokens[mint] = {
+                "t0": t0_ts,
+                "symbol": symbol,
+                "tx_sig": tx_sig,
+                "snapshots": {},
+                "state": "pending",
+                "created_at": time.time(),
+            }
+
+    def get_due_snapshots(self, now_ts: int) -> list[tuple[str, str]]:
+        """
+        Return list of (mint, window_label) that are due for collection.
+        window_label is one of "t1m", "t5m", "t15m".
+        """
+        due: list[tuple[str, str]] = []
+        with self._lock:
+            for mint, data in list(self._tokens.items()):
+                if data["state"] == "complete":
+                    continue
+                t0 = data["t0"]
+                elapsed = now_ts - t0
+                for window_label, window_sec in SNAPSHOT_WINDOWS.items():
+                    if window_label not in data["snapshots"] and elapsed >= window_sec:
+                        due.append((mint, window_label))
+        return due
+
+    def record_snapshot(self, mint: str, window_label: str, data: dict) -> None:
+        """Store collected snapshot data."""
+        with self._lock:
+            token = self._tokens.get(mint)
+            if not token:
+                return
+            token["snapshots"][window_label] = data
+            token["state"] = "collecting"
+
+    def finalize(self, mint: str) -> Optional[dict]:
+        """
+        Mark a token as complete and return all accumulated data.
+        Returns None if the token was not found or not ready.
+        """
+        with self._lock:
+            token = self._tokens.get(mint)
+            if not token:
+                return None
+            if "t15m" not in token["snapshots"]:
+                return None  # not ready yet
+            token["state"] = "complete"
+            return dict(token)  # return a copy
+
+    def remove(self, mint: str) -> None:
+        """Remove a token from the scheduler after it's been saved."""
+        with self._lock:
+            self._tokens.pop(mint, None)
+
+    def cleanup_stale(self, max_age_seconds: int = 1200) -> int:
+        """
+        Remove tokens that never completed within max_age_seconds.
+        Returns count of removed tokens.
+        """
+        now = time.time()
+        removed = 0
+        with self._lock:
+            for mint, data in list(self._tokens.items()):
+                if data["state"] == "complete":
+                    self._tokens.pop(mint, None)
+                    removed += 1
+                elif now - data["created_at"] > max_age_seconds:
+                    log.warning("Removing stale token %s (age: %.0fs, state: %s)",
+                                mint[:12], now - data["created_at"], data["state"])
+                    self._tokens.pop(mint, None)
+                    removed += 1
+        return removed
+
+    def get_t0(self, mint: str) -> int:
+        """Return the T0 timestamp for a tracked mint, or 0 if not found."""
+        with self._lock:
+            token = self._tokens.get(mint)
+            return token["t0"] if token else 0
+
+    def pending_count(self) -> int:
+        """Number of tokens currently being tracked."""
+        with self._lock:
+            return sum(1 for d in self._tokens.values() if d["state"] != "complete")
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._tokens)
 
 
 # ===================================================================
@@ -170,25 +253,6 @@ def save_to_supabase(record: dict) -> bool:
         return False
 
 
-def save_batch(records: list[dict]) -> int:
-    """Upsert a batch of records into Supabase.  Returns count saved."""
-    if not records:
-        return 0
-    try:
-        supabase.table("training_tokens").upsert(
-            records, on_conflict="mint",
-        ).execute()
-        return len(records)
-    except Exception as e:
-        log.error("Supabase batch upsert failed: %s", e)
-        # Fall back to one-by-one
-        saved = 0
-        for record in records:
-            if save_to_supabase(record):
-                saved += 1
-        return saved
-
-
 # ===================================================================
 # MINT EXTRACTION
 # ===================================================================
@@ -199,22 +263,17 @@ def _is_valid_mint(mint: str) -> bool:
     return mint not in SKIP_MINTS and mint != PUMP_MIGRATION_PROGRAM
 
 
-def extract_mint_from_tx(tx: dict) -> str | None:
+def extract_mint_from_tx(tx: dict) -> Optional[str]:
     """
     Extract the token mint address from a Helius enhanced transaction.
-
-    Pump.fun migration transactions contain token-balance changes or
-    token-transfers that reveal the mint being migrated to Raydium.
-
-    Filters out well-known non-pump.fun mints (WSOL, USDC, USDT, etc.).
     """
-    # Strategy 1 — tokenTransfers array (Helius enhanced)
+    # Strategy 1 — tokenTransfers
     for transfer in tx.get("tokenTransfers", []):
         mint = transfer.get("mint")
         if mint and _is_valid_mint(mint):
             return mint
 
-    # Strategy 2 — accountData (Helius enhanced)
+    # Strategy 2 — accountData
     for acct in tx.get("accountData", []):
         if not _is_valid_mint(acct.get("account", "")):
             continue
@@ -228,7 +287,7 @@ def extract_mint_from_tx(tx: dict) -> str | None:
         if mint and _is_valid_mint(mint):
             return mint
 
-    # Strategy 4 — logMessages parsing (fallback)
+    # Strategy 4 — logMessages parsing
     for msg in tx.get("logMessages", []):
         if "mint" in msg.lower() or "token" in msg.lower():
             for word in msg.split():
@@ -239,19 +298,17 @@ def extract_mint_from_tx(tx: dict) -> str | None:
 
 
 # ===================================================================
-# STEP 1: GET GRADUATED MINTS FROM HELIUS
+# HELIUS API — MIGRATION DETECTION
 # ===================================================================
 
 
 def get_graduated_mints(
-    before_sig: str | None = None,
+    before_sig: Optional[str] = None,
     limit: int = 100,
 ) -> list[dict]:
     """
-    Fetches recently graduated pump.fun tokens
-    from the migration program transaction history.
-    No text search — raw program transactions only.
-    ~0.5 s delay between calls (2 req/s free tier).
+    Fetches recently graduated pump.fun tokens from migration program
+    transaction history. ~0.5s delay between calls (2 req/s).
     """
     url = (
         f"https://api.helius.xyz/v0/addresses/"
@@ -264,7 +321,7 @@ def get_graduated_mints(
     def fetch():
         r = requests.get(url, params=params, timeout=15)
         if r.status_code == 429:
-            log.warning("Helius rate limited")
+            log.warning("Helius rate limited (migration detection)")
             return None
         r.raise_for_status()
         return r.json()
@@ -275,111 +332,60 @@ def get_graduated_mints(
 
 
 # ===================================================================
-# STEP 2: BATCH ASSET METADATA FROM HELIUS
+# HELIUS API — DAS ASSET METADATA (for T0 symbol + holders)
 # ===================================================================
 
 
-def get_assets_batch(mints: list[str]) -> list[dict]:
+def get_asset(mint: str) -> dict:
     """
-    Fetches token metadata for up to 100 mints.
-    Uses Helius DAS getAssets batch endpoint.
-    Much faster than individual getAsset calls.
-    ~0.5 s delay (2 req/s free tier).
+    Fetch DAS asset metadata for a single mint.
+    Used at T0 for symbol and initial holder count.
     """
-    if not mints:
-        return []
-
     url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}"
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "getAssetBatch",
+        "method": "getAsset",
         "params": {
-            "ids": mints[:100],
+            "id": mint,
             "displayOptions": {"showFungible": True},
         },
     }
 
     def fetch():
-        r = requests.post(url, json=payload, timeout=30)
+        r = requests.post(url, json=payload, timeout=15)
         if r.status_code == 429:
             return None
         r.raise_for_status()
-        return r.json().get("result", [])
+        return r.json().get("result", {})
 
-    result = with_retry(fetch)
-    time.sleep(0.5)
-    return result or []
-
-
-# ===================================================================
-# STEP 3: BATCH PRICE DATA FROM DEXSCREENER
-# ===================================================================
-
-
-def get_prices_batch(mints: list[str]) -> dict[str, dict]:
-    """
-    Fetches price + liquidity data for up to 30 mints from DexScreener.
-    Free tier — no API key, no strict rate limit on the pairs endpoint.
-    Returns dict: mint → price_data.
-    """
-    if not mints:
-        return {}
-
-    ids = ",".join(mints[:30])
-    url = f"https://api.dexscreener.com/latest/dex/tokens/{ids}"
-
-    def fetch():
-        r = requests.get(url, timeout=15)
-        if r.status_code == 429:
-            return None
-        r.raise_for_status()
-        return r.json()
-
-    result = with_retry(fetch, max_retries=2, base_wait=0.5)
-    # No sleep — DexScreener pairs endpoint has no hard rate limit
-
-    if not result:
-        return {}
-
-    price_map: dict[str, dict] = {}
-    for pair in result.get("pairs", []) or []:
-        mint = pair.get("baseToken", {}).get("address", "")
-        if mint and mint not in price_map:
-            price_map[mint] = {
-                "price_usd": float(pair.get("priceUsd", 0) or 0),
-                "liquidity_usd": float(
-                    (pair.get("liquidity") or {}).get("usd", 0) or 0
-                ),
-                "volume_24h": float(
-                    (pair.get("volume") or {}).get("h24", 0) or 0
-                ),
-                "price_change_24h": float(
-                    (pair.get("priceChange") or {}).get("h24", 0) or 0
-                ),
-                "created_at": pair.get("pairCreatedAt", 0),
-            }
-    return price_map
+    result = with_retry(fetch, max_retries=3, base_wait=0.5)
+    time.sleep(0.3)
+    return result or {}
 
 
 # ===================================================================
-# STEP 4: GET SWAP TRANSACTIONS FROM HELIUS
+# HELIUS API — SWAP TRANSACTIONS PER WINDOW
 # ===================================================================
 
 
-def get_token_swaps(
+def get_token_swaps_window(
     mint: str,
-    graduation_ts: int,
+    from_ts: int,
+    to_ts: int,
+    limit: int = 50,
 ) -> list[dict]:
     """
-    Gets swap transactions for sequence features.
-    Fetches first 100 swaps after graduation.
-    ~0.5 s delay (2 req/s).
+    Fetch swap transactions for a token within a time window.
+    Filters swaps where timestamp is in [from_ts, to_ts].
+
+    Uses Helius enhanced transactions endpoint with type=SWAP.
+    ~0.5s delay between calls (2 req/s).
     """
     url = f"https://api.helius.xyz/v0/addresses/{mint}/transactions"
     params: dict = {
         "api-key": HELIUS_KEY,
-        "limit": 100,
+        "limit": limit,
         "type": "SWAP",
     }
 
@@ -389,366 +395,248 @@ def get_token_swaps(
             return None
         r.raise_for_status()
         txs = r.json()
-        # Filter to 72 h window after graduation
+        # Filter to time window
         return [
-            tx
-            for tx in txs
-            if tx.get("timestamp", 0) >= graduation_ts
-            and tx.get("timestamp", 0) <= graduation_ts + 259200
+            tx for tx in txs
+            if from_ts <= tx.get("timestamp", 0) <= to_ts
         ]
 
-    result = with_retry(fetch)
-    time.sleep(0.5)
+    result = with_retry(fetch, max_retries=3, base_wait=0.5)
+    time.sleep(0.5)  # 2 req/s limit
     return result or []
 
 
 # ===================================================================
-# STEP 5: COMPUTE FEATURES
+# DEXSCREENER API — SINGLE-TOKEN PRICE SNAPSHOT
 # ===================================================================
 
 
-def compute_features(
-    asset: dict,
-    swaps: list[dict],
-    graduation_ts: int,
-) -> tuple[dict, list[list]]:
+def get_price_snapshot(mint: str) -> dict:
     """
-    Computes all 14 tabular features and a [16, 6] sequence
-    from raw on-chain data.  No Rugcheck dependency.
+    Fetch current price + liquidity for a single mint from DexScreener.
+
+    Returns dict with: price_usd, liquidity_usd, fdv, pair_created_at
     """
-    features: dict = {}
+    url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
 
-    # ---- Authority features (from DAS asset) ----
-    authorities = asset.get("authorities", [])
-    features["mint_authority_active"] = float(
-        any("mint" in a.get("scopes", []) for a in authorities)
-    )
-    features["freeze_authority_active"] = float(
-        any("freeze" in a.get("scopes", []) for a in authorities)
-    )
-    features["mutable_metadata"] = float(asset.get("mutable", True))
+    def fetch():
+        r = requests.get(url, timeout=10)
+        if r.status_code == 429:
+            return None
+        r.raise_for_status()
+        return r.json()
 
-    # ---- Default values ----
-    features.update({
-        "lp_burn_pct": 0.9,
-        "initial_liquidity_sol": 0.0,
-        "liquidity_concentration": 0.0,
-        "dev_hold_pct": 0.0,
-        "top10_holder_pct": 0.0,
-        "bundle_wallet_count": 0.0,
-        "migration_speed_seconds": 0.5,
-        "buy_sell_ratio_60s": 0.5,
-        "price_velocity_60s": 0.0,
-        "unique_buyers_60s": 0.0,
-        "avg_transaction_size_sol": 0.0,
-    })
+    result = with_retry(fetch, max_retries=2, base_wait=0.5)
 
-    if not swaps:
-        return features, []
+    if not result:
+        return {}
 
-    # ---- Initial liquidity from first swap ----
-    first_ev = swaps[0].get("events", {}).get("swap", {})
-    native_in = int((first_ev.get("nativeInput") or {}).get("amount", 0) or 0)
-    pool_sol = abs(native_in) / 1e9
-    features["initial_liquidity_sol"] = min(pool_sol / 1000, 1.0)
+    pairs = result.get("pairs", []) or []
+    if not pairs:
+        return {}
 
-    # ---- First 60 seconds behavior ----
-    swaps_60s = [
-        s for s in swaps
-        if graduation_ts <= s.get("timestamp", 0) <= graduation_ts + 60
-    ]
-
-    if swaps_60s:
-        buyers: set[str] = set()
-        buy_vol = sell_vol = 0.0
-        prices: list[float] = []
-
-        for swap in swaps_60s:
-            ev = swap.get("events", {}).get("swap", {})
-            signer = swap.get("feePayer", "")
-            nat_in = (ev.get("nativeInput") or {})
-            nat_out = (ev.get("nativeOutput") or {})
-            tok_out = ev.get("tokenOutputs", [{}])
-
-            in_amt = int(nat_in.get("amount", 0) or 0)
-            out_amt = int(nat_out.get("amount", 0) or 0)
-            sol_in = in_amt / 1e9
-
-            if in_amt:
-                buyers.add(signer)
-                buy_vol += in_amt
-            if out_amt:
-                sell_vol += out_amt
-
-            tok_amt = float(tok_out[0].get("tokenAmount", 0)) if tok_out else 0
-            if tok_amt > 0:
-                prices.append(sol_in / tok_amt)
-
-        # Aggregate metrics
-        total_vol = buy_vol + sell_vol
-        features["buy_sell_ratio_60s"] = (
-            (buy_vol / total_vol) if total_vol > 0 else 0.5
-        )
-        features["unique_buyers_60s"] = min(len(buyers) / 100, 1.0)
-
-        if len(prices) >= 2 and prices[0] > 0:
-            change = (prices[-1] - prices[0]) / prices[0]
-            features["price_velocity_60s"] = max(min(change, 1.0), -1.0)
-
-        avg_swap = ((buy_vol / len(buyers)) / 1e9) if buyers else 0.0
-        features["avg_transaction_size_sol"] = min(avg_swap / 10, 1.0)
-
-    # ---- Build [16, 6] temporal sequence ----
-    sequence: list[list] = []
-    seq_buyers: set[str] = set()
-    seq_buy_vol = seq_sell_vol = 0.0
-
-    for i, swap in enumerate(swaps[:SEQUENCE_LENGTH]):
-        ev = swap.get("events", {}).get("swap", {})
-        signer = swap.get("feePayer", "")
-        seq_in = int((ev.get("nativeInput") or {}).get("amount", 0) or 0)
-        seq_out = int((ev.get("nativeOutput") or {}).get("amount", 0) or 0)
-
-        sol_in = seq_in / 1e9
-        if seq_in:
-            seq_buyers.add(signer)
-            seq_buy_vol += seq_in
-        if seq_out:
-            seq_sell_vol += seq_out
-
-        total_nat = seq_buy_vol + seq_sell_vol
-        sequence.append([
-            len(seq_buyers),                            # holders (cumulative buyers)
-            pool_sol,                                   # liquidity
-            total_nat / 1e9,                            # volume
-            (seq_buy_vol / total_nat) if total_nat > 0 else 0.5,  # buy ratio
-            sol_in,                                     # velocity
-            i + 1,                                      # tx_count
-        ])
-
-    # Pad sequence to exactly [16, 6]
-    while len(sequence) < SEQUENCE_LENGTH:
-        sequence.append([0, 0, 0, 0.5, 0, 0])
-
-    return features, sequence[:SEQUENCE_LENGTH]
-
-
-# ===================================================================
-# LABEL COMPUTATION  (rug / drawdown / pump-2x)
-# ===================================================================
-
-
-def compute_labels_dexscreener(
-    price_data: dict,
-    graduation_ts: int,
-) -> dict:
-    """
-    Compute profit-tier targets from DexScreener price_change_24h.
-
-    Targets are NOT mutually exclusive — a 10x token also sets did_2x
-    and did_5x, allowing the model to predict each threshold independently.
-    """
-    price_change_24h = price_data.get("price_change_24h", 0)
-    liquidity_usd = price_data.get("liquidity_usd", 0)
-
-    # Profit tiers (cumulative)
-    did_2x = 1 if price_change_24h >= 100 else 0
-    did_5x = 1 if price_change_24h >= 400 else 0
-    did_10x = 1 if price_change_24h >= 900 else 0
-
-    # If LP is gone, no profit tier is valid — treat as dead
-    if liquidity_usd < 10:
-        did_2x = did_5x = did_10x = 0
-
-    max_drawdown = max(0.0, -price_change_24h)
-
+    # Use the first Solana/Raydium pair
+    pair = pairs[0]
     return {
-        "did_2x": did_2x,
-        "did_5x": did_5x,
-        "did_10x": did_10x,
-        "max_drawdown_pct": max_drawdown,
-        "inferred_label": True,
+        "price_usd": float(pair.get("priceUsd", 0) or 0),
+        "liquidity_usd": float(
+            (pair.get("liquidity") or {}).get("usd", 0) or 0
+        ),
+        "fdv": float(pair.get("fdv", 0) or 0),
+        "pair_created_at": pair.get("pairCreatedAt", 0),
+    }
+
+
+def get_price_data_24h(mint: str) -> Optional[dict]:
+    """
+    Fetch 24h price change + liquidity from DexScreener for label computation.
+    Returns dict with: price_change_24h, liquidity_usd, volume_24h
+    """
+    url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+
+    def fetch():
+        r = requests.get(url, timeout=10)
+        if r.status_code == 429:
+            return None
+        r.raise_for_status()
+        return r.json()
+
+    result = with_retry(fetch, max_retries=2, base_wait=0.5)
+
+    if not result:
+        return None
+
+    pairs = result.get("pairs", []) or []
+    if not pairs:
+        return None
+
+    pair = pairs[0]
+    return {
+        "price_change_24h": float(
+            (pair.get("priceChange") or {}).get("h24", 0) or 0
+        ),
+        "liquidity_usd": float(
+            (pair.get("liquidity") or {}).get("usd", 0) or 0
+        ),
+        "volume_24h": float(
+            (pair.get("volume") or {}).get("h24", 0) or 0
+        ),
     }
 
 
 # ===================================================================
-# QUALITY FILTER — avoid spending 100 Helius credits on bad tokens
-# ===================================================================
-
-
-def should_fetch_swaps(asset: dict, price_data: dict | None) -> bool:
-    """
-    Only spend 100 credits on swap data for tokens that look promising.
-
-    Returns False for tokens likely to be rugs or with no price history,
-    saving ~75% of monthly credit budget (5x more tokens collected).
-    """
-    # Must have DexScreener data — no price history = skip
-    if not price_data:
-        return False
-
-    # Must have meaningful liquidity (LP not drained yet)
-    if price_data.get("liquidity_usd", 0) < 50:
-        return False
-
-    # Both mint + freeze authority active → immediate rug risk
-    mint_ext = asset.get("mint_extensions", {}) or {}
-    mint_auth = mint_ext.get("mint_authority", "") or ""
-    freeze_auth = mint_ext.get("freeze_authority", "") or ""
-    if mint_auth and freeze_auth:
-        return False
-
-    # Must have valid supply
-    supply = asset.get("supply") or {}
-    if not supply or int(supply.get("supply", "0") or 0) <= 0:
-        return False
-
-    return True
-
-
-# ===================================================================
-# TOKEN PROCESSING PIPELINE
+# RECORD BUILDER
 # ===================================================================
 
 
 def build_record(
     mint: str,
-    graduation_ts: int,
-    tx_signature: str,
-    asset: dict,
-    swaps: list[dict],
-    price_data: dict | None,
+    t0_ts: int,
+    scheduler_data: dict,
 ) -> dict:
-    """Build a single token record from all data sources."""
-    features, sequence = compute_features(asset, swaps, graduation_ts)
+    """
+    Build a complete training_tokens record from scheduler-accumulated
+    snapshot data using the features.py compute_all_features() function.
+    """
+    snapshots_raw = scheduler_data.get("snapshots", {})
 
-    # Compress sequence using float16 base64
-    sequence_b64 = compress_sequence(sequence) if sequence else zero_sequence()
-
-    # Labels from DexScreener
-    if price_data:
-        labels = compute_labels_dexscreener(price_data, graduation_ts)
-    else:
-        # Fallback: no price data → all profit tiers default to 0
-        labels = {
-            "did_2x": 0,
-            "did_5x": 0,
-            "did_10x": 0,
-            "max_drawdown_pct": 0.0,
-            "inferred_label": False,
+    # Build snapshots dict for features.py (price + liquidity per timestamp)
+    snapshots: dict[str, dict] = {}
+    for window_label in ("t0", "t1m", "t5m", "t15m"):
+        snap = snapshots_raw.get(window_label, {})
+        price = snap.get("price", {})
+        snapshots[window_label] = {
+            "price_usd": price.get("price_usd", 0) if price else 0,
+            "liquidity_usd": price.get("liquidity_usd", 0) if price else 0,
+            "timestamp": t0_ts + SNAPSHOT_WINDOWS.get(window_label, 0) if window_label != "t0" else t0_ts,
         }
 
+    # Build swaps_by_window dict for features.py
+    swaps_by_window: dict[str, list] = {}
+    for window_label in ("t1m", "t5m", "t15m"):
+        snap = snapshots_raw.get(window_label, {})
+        raw_swaps = snap.get("swaps", [])
+        window_start = t0_ts
+        window_end = t0_ts + SNAPSHOT_WINDOWS[window_label]
+        parsed = parse_swaps_for_window(raw_swaps, window_start, window_end)
+        feature_key = WINDOW_KEY_MAP[window_label]
+        swaps_by_window[feature_key] = parsed
+
+    # Holder snapshots from DAS metadata
+    holder_snapshots: dict[str, int] = {}
+    for window_label in ("t1m", "t5m", "t15m"):
+        snap = snapshots_raw.get(window_label, {})
+        asset = snap.get("asset", {})
+        feature_key = WINDOW_KEY_MAP[window_label]
+        holder_snapshots[feature_key] = (
+            asset.get("holder_count", 0) if asset else 0
+        )
+
+    # 24h data for labels (fetched after 15m when we have mature data)
+    price_24h = get_price_data_24h(mint)
+
+    # Compute all features
+    features = compute_all_features(
+        snapshots=snapshots,
+        swaps_by_window=swaps_by_window,
+        holder_snapshots=holder_snapshots,
+        price_data_24h=price_24h,
+    )
+
+    # Build record
     record = {
         "mint": mint,
-        "graduation_timestamp": graduation_ts,
+        "symbol": scheduler_data.get("symbol", ""),
+        "graduation_timestamp": t0_ts,
         "collected_at": datetime.now(timezone.utc).isoformat(),
+        "deployer_address": "",  # populated from DAS if available
         **features,
-        "sequence_b64": sequence_b64,
-        "has_sequence": len(swaps) > 0,
-        **labels,
-        "deployer_address": asset.get("ownership", {}).get("owner", ""),
     }
-
-    # Attach DexScreener metadata columns when available
-    if price_data:
-        record["price_usd"] = price_data.get("price_usd", 0)
-        record["liquidity_usd"] = price_data.get("liquidity_usd", 0)
-        record["volume_24h"] = price_data.get("volume_24h", 0)
-        record["price_change_24h"] = price_data.get("price_change_24h", 0)
 
     return record
 
 
-def process_batch(
-    tokens: list[tuple[str, int, str]],
-    total_collected: int,
-    start_time: float,
-    backfill: bool = False,
-) -> tuple[int, float]:
+# ===================================================================
+# SNAPSHOT COLLECTION ORCHESTRATOR
+# ===================================================================
+
+
+def collect_snapshot_for_token(
+    mint: str,
+    t0_ts: int,
+    window_label: str,
+) -> dict:
     """
-    Process a batch of new tokens through the full pipeline:
-      1. Helius getAssetBatch  (100 tokens × 2 req/s)
-      2. DexScreener price batch (30 tokens, no rate limit)
-      3. Per-token swap fetch     (individual × 2 req/s)
-      4. Build records + save to Supabase
+    Collect all data needed for a single snapshot window.
 
-    When backfill=True, skip ALL swap fetches — every token is saved
-    with zero_sequence.  This burns ~0.11 credits/token instead of
-    ~100 credits/token, allowing ~250K tokens/day on the Free tier.
-    Swap data can be backfilled in a second pass later.
+    For each window, fetches:
+      - DexScreener price/liquidity
+      - Helius swap transactions within [T0, T0+window_seconds]
+      - Helius DAS asset metadata (for holder count)
 
-    Returns (new_tokens_saved, tokens_per_second).
+    Returns a dict to store in the scheduler.
     """
-    if not tokens:
-        return 0, 0.0
+    window_sec = SNAPSHOT_WINDOWS[window_label]
+    from_ts = t0_ts
+    to_ts = t0_ts + window_sec
 
-    mints = [t[0] for t in tokens]
-    new_count = 0
+    # Fetch price from DexScreener
+    price = get_price_snapshot(mint)
 
-    # ── Phase 1: Helius DAS assets (batches of 100) ──
-    asset_map: dict[str, dict] = {}
-    for i in range(0, len(mints), 100):
-        chunk = mints[i : i + 100]
-        batch_result = get_assets_batch(chunk)
-        for item in batch_result:
-            if isinstance(item, dict) and "id" in item:
-                asset_map[item["id"]] = item
-        log.info("  Assets: %d/%d fetched", len(asset_map), len(mints))
-        if i + 100 < len(mints):
-            time.sleep(0.5)  # 2 req/s limit
+    # Fetch swaps from Helius
+    swaps = get_token_swaps_window(mint, from_ts, to_ts)
 
-    # ── Phase 2: DexScreener prices (batches of 30) ──
-    price_map: dict[str, dict] = {}
-    for i in range(0, len(mints), 30):
-        chunk = mints[i : i + 30]
-        batch_result = get_prices_batch(chunk)
-        price_map.update(batch_result)
-    # No delay — DexScreener has no strict rate limit on the pairs endpoint
+    # Fetch asset metadata for holder count
+    asset = get_asset(mint)
+    holders = 0
+    if asset:
+        supply_info = asset.get("supply", {}) or {}
+        holders = int(supply_info.get("holderCount", 0) or 0)
 
-    priced = len(price_map)
-    log.info("  Prices: %d/%d tokens have DexScreener data", priced, len(mints))
+    return {
+        "price": price,
+        "swaps": swaps,
+        "asset": {
+            "holder_count": holders,
+        },
+        "collected_at": datetime.now(timezone.utc).isoformat(),
+    }
 
-    # ── Phase 3: Per-token swaps (backfill skips all — saves 100 credits/token) ──
-    records: list[dict] = []
-    fetched_swaps = skipped_swaps = 0
-    for mint, graduation_ts, tx_sig in tokens:
-        asset = asset_map.get(mint, {})
-        price_data = price_map.get(mint)
 
-        if backfill:
-            # Skip ALL swap fetches — metadata + labels only
-            swaps = []
-            skipped_swaps += 1
-        elif should_fetch_swaps(asset, price_data):
-            swaps = get_token_swaps(mint, graduation_ts)
-            fetched_swaps += 1
-        else:
-            swaps = []
-            skipped_swaps += 1
+def collect_t0_snapshot(mint: str, t0_ts: int) -> dict:
+    """
+    Collect T0 baseline snapshot immediately after migration detection.
+    Tries to get DexScreener price (may not exist yet for brand-new pairs)
+    and DAS metadata for symbol.
+    """
+    price = get_price_snapshot(mint)
+    asset = get_asset(mint)
 
-        record = build_record(mint, graduation_ts, tx_sig, asset, swaps, price_data)
-        records.append(record)
+    symbol = ""
+    holders = 0
+    deployer = ""
+    if asset:
+        content = asset.get("content", {}) or {}
+        metadata = content.get("metadata", {}) or {}
+        symbol = metadata.get("symbol", "")
+        supply_info = asset.get("supply", {}) or {}
+        holders = int(supply_info.get("holderCount", 0) or 0)
+        ownership = asset.get("ownership", {}) or {}
+        deployer = ownership.get("owner", "")
 
-    if backfill:
-        log.info("  Swaps: BACKFILL — all %d tokens saved (no swap fetch)",
-                 skipped_swaps)
-    elif skipped_swaps:
-        log.info("  Swaps: %d fetched, %d skipped (saves %d credits)",
-                 fetched_swaps, skipped_swaps, skipped_swaps * 100)
-
-    # ── Phase 4: Save to Supabase ──
-    saved = save_batch(records)
-    new_count += saved
-
-    # ── Throughput ──
-    elapsed = time.time() - start_time
-    tps = (total_collected + saved) / elapsed if elapsed > 0 else 0.0
-
-    return new_count, tps
+    return {
+        "price": price,
+        "asset": {
+            "holder_count": holders,
+            "symbol": symbol,
+            "deployer": deployer,
+        },
+        "collected_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 # ===================================================================
-# KEEP-ALIVE HTTP SERVER  (prevents Render free-tier spin-down)
+# KEEP-ALIVE HTTP SERVER
 # ===================================================================
 
 
@@ -760,7 +648,6 @@ class _KeepAliveHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"collector_bot alive\n")
 
     def log_message(self, fmt: str, *args) -> None:
-        """Suppress default HTTP access logging."""
         pass
 
 
@@ -778,33 +665,39 @@ def start_keepalive_server(port: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="collector_bot — pump.fun token data collection"
+        description="collector_bot — snapshot-based pump.fun token data collection"
     )
     parser.add_argument(
-        "--backfill",
+        "--quality-report-only",
         action="store_true",
-        help="Skip swap fetching entirely — collect metadata + labels only "
-             "(~0.11 credits/token vs 100, ~250K tokens/day on Free tier). "
-             "Swap sequences can be backfilled in a second pass.",
+        help="Run quality validation on existing data and exit.",
     )
     args = parser.parse_args()
 
-    # Env var BACKFILL=true overrides CLI arg — toggle from Render dashboard
-    backfill = (
-        os.environ.get("BACKFILL", "").lower() == "true"
-        or args.backfill
-    )
+    log.info("========================================")
+    log.info("collector_bot v2 — snapshot data collection")
+    log.info("========================================")
+    log.info("Helius key   : %s", "SET" if HELIUS_KEY else "MISSING")
+    log.info("Supabase URL : %s", "SET" if SUPABASE_URL else "MISSING")
+    log.info("Poll interval: %ds", INTERVAL)
+    log.info("Quality check: every %d tokens", QUALITY_CHECK_INTERVAL)
+    log.info("Snapshots    : T0, T0+1m, T0+5m, T0+15m")
+    log.info("Features     : 50 post-migration trading features")
 
-    mode = "BACKFILL (no swaps)" if backfill else "collect (with swaps)"
-    log.info("========================================")
-    log.info("collector_bot — data collection service")
-    log.info("Mode        : %s", mode)
-    log.info("========================================")
-    log.info("Helius key  : %s", "SET" if HELIUS_KEY else "MISSING")
-    log.info("Supabase URL: %s", "SET" if SUPABASE_URL else "MISSING")
-    log.info("Interval    : %ds", INTERVAL)
-    log.info("Batch sizes : Helius=100, DexScreener=30")
-    log.info("Sequence    : float16 base64 (~256 B/row)")
+    # ---- Quality-report-only mode ----
+    if args.quality_report_only:
+        log.info("Running quality report on existing data...")
+        try:
+            result = supabase.table("training_tokens").select("*").limit(500).execute()
+            rows = result.data if result.data else []
+            if rows:
+                report = run_quality_check(rows, write_report=True)
+                print(report)
+            else:
+                log.warning("No rows found for quality check.")
+        except Exception as e:
+            log.error("Quality report failed: %s", e)
+        return
 
     # ---- Start keep-alive HTTP server in background ----
     keepalive_thread = Thread(
@@ -817,90 +710,124 @@ def main() -> None:
     existing = get_existing_mints()
     log.info("Already collected: %d tokens", len(existing))
 
-    before_sig: str | None = None
+    # ---- Initialize scheduler + quality validator ----
+    scheduler = SnapshotScheduler()
+    quality = QualityValidator()
+
+    before_sig: Optional[str] = None
     total_collected = len(existing)
+    last_quality_check = total_collected
     cycle = 0
     start_time = time.time()
-    last_throughput_log = total_collected
 
     while True:
         try:
             cycle += 1
-            log.info("--- Cycle %d ---", cycle)
+            now_ts = int(time.time())
 
-            # Fetch new graduated-mint transactions  (STEP 1)
+            # =====================================================
+            # STEP 1: Detect new migrations
+            # =====================================================
             txs = get_graduated_mints(before_sig)
 
-            if not txs:
-                log.info("No new transactions returned — "
-                         "sleeping %ds", INTERVAL)
-                time.sleep(INTERVAL)
-                continue
-
-            log.info("Got %d transactions from Helius", len(txs))
-
-            # Collect new (unseen) tokens for batch processing
-            new_tokens: list[tuple[str, int, str]] = []
-            for tx in txs:
-                mint = extract_mint_from_tx(tx)
-                if not mint or mint in existing:
-                    continue
-                sig = tx.get("signature", "")
-                ts = tx.get("timestamp", 0)
-                new_tokens.append((mint, ts, sig))
-                existing.add(mint)  # mark seen immediately
-
-            if not new_tokens:
-                log.info("All %d tx already collected — "
-                         "sleeping %ds", len(txs), INTERVAL)
-                # Update pagination cursor
-                if txs:
-                    before_sig = txs[-1].get("signature", before_sig)
-                time.sleep(INTERVAL)
-                continue
-
-            log.info("%d new tokens to process in batch", len(new_tokens))
-
-            # Process the batch  (STEPS 2–5)
-            new_count, tps = process_batch(
-                new_tokens, total_collected, start_time,
-                backfill=backfill,
-            )
-            total_collected += new_count
-
-            log.info("Cycle %d done: +%d new  (total: %d)",
-                     cycle, new_count, total_collected)
-
-            # ---- Throughput logging every 1000 tokens ----
-            if total_collected - last_throughput_log >= 1000:
-                last_throughput_log = total_collected
-                elapsed_hrs = (time.time() - start_time) / 3600
-                eta_1M = (
-                    (1_000_000 - total_collected) / max(tps, 0.01) / 3600
-                )
-                log.info(
-                    "Throughput: %.1f tok/s | "
-                    "Total: %d | "
-                    "Uptime: %.1fh | "
-                    "ETA 1M: %.1fh",
-                    tps, total_collected, elapsed_hrs, eta_1M,
-                )
-
-            # Update pagination cursor to the oldest tx in this batch
             if txs:
+                new_count = 0
+                for tx in txs:
+                    mint = extract_mint_from_tx(tx)
+                    if not mint or mint in existing:
+                        continue
+                    sig = tx.get("signature", "")
+                    t0_ts = tx.get("timestamp", 0)
+
+                    # Collect T0 baseline immediately
+                    t0_data = collect_t0_snapshot(mint, t0_ts)
+                    symbol = ""
+                    if t0_data.get("asset", {}).get("symbol"):
+                        symbol = t0_data["asset"]["symbol"]
+
+                    # Schedule future snapshots
+                    scheduler.schedule(mint, t0_ts, sig, symbol)
+                    scheduler.record_snapshot(mint, "t0", t0_data)
+                    existing.add(mint)
+                    new_count += 1
+
+                if new_count:
+                    log.info("Cycle %d: detected %d new migrations (tracking: %d pending)",
+                             cycle, new_count, scheduler.pending_count())
+
+                # Update pagination cursor
                 before_sig = txs[-1].get("signature", before_sig)
+
+            # =====================================================
+            # STEP 2: Collect due snapshots
+            # =====================================================
+            due = scheduler.get_due_snapshots(now_ts)
+
+            for mint, window_label in due:
+                t0_ts = scheduler.get_t0(mint)
+
+                if not t0_ts:
+                    continue
+
+                log.info("  Snapshot: %s @ %s (%ds after T0)",
+                         mint[:12], window_label, now_ts - t0_ts)
+
+                snap_data = collect_snapshot_for_token(mint, t0_ts, window_label)
+                scheduler.record_snapshot(mint, window_label, snap_data)
+
+                # If this is the final (t15m) snapshot, finalize and save
+                if window_label == "t15m":
+                    finalized = scheduler.finalize(mint)
+                    if finalized:
+                        record = build_record(mint, t0_ts, finalized)
+                        saved = save_to_supabase(record)
+                        if saved:
+                            total_collected += 1
+                            quality.add_record(record)
+                            scheduler.remove(mint)
+
+            # =====================================================
+            # STEP 3: Quality check
+            # =====================================================
+            if total_collected - last_quality_check >= QUALITY_CHECK_INTERVAL:
+                last_quality_check = total_collected
+                if quality.records:
+                    report_json = quality.generate_report()
+                    flags = json.loads(report_json)
+                    flagged_count = flags["features_flagged"]
+                    log.info("Quality check: %d rows, %d features, %d flagged",
+                             flags["total_rows"], flags["features_checked"], flagged_count)
+                    if flagged_count > 0:
+                        flagged_names = [f["feature_name"] for f in flags["flags"] if f["flagged"]]
+                        log.warning("Flagged features: %s", ", ".join(flagged_names))
+                    quality.reset()
+
+            # =====================================================
+            # STEP 4: Cleanup stale entries
+            # =====================================================
+            stale_removed = scheduler.cleanup_stale(max_age_seconds=1200)
+            if stale_removed > 0:
+                log.info("Cleaned up %d stale/completed scheduler entries", stale_removed)
+
+            # =====================================================
+            # STEP 5: Throughput logging (every 100 tokens)
+            # =====================================================
+            if total_collected > 0 and total_collected % 100 == 0:
+                elapsed_hrs = (time.time() - start_time) / 3600
+                tps = total_collected / max(time.time() - start_time, 1)
+                eta_1M = (1_000_000 - total_collected) / max(tps, 0.001) / 3600
+                log.info(
+                    "Throughput: %.3f tok/s | Total: %d | Uptime: %.1fh | ETA 1M: %.1fh | Pending: %d",
+                    tps, total_collected, elapsed_hrs, eta_1M, scheduler.pending_count(),
+                )
 
         except KeyboardInterrupt:
             log.info("Shutdown requested — exiting.")
             break
         except Exception:
-            log.exception("Unhandled error in main loop — "
-                          "sleeping %ds before retry", INTERVAL)
+            log.exception("Unhandled error in main loop — sleeping %ds before retry", INTERVAL)
 
-        # Backfill: skip sleep when tokens are flowing (max throughput).
-        # Steady-state collection: sleep INTERVAL seconds between cycles.
-        if not backfill:
-            time.sleep(INTERVAL)
+        time.sleep(INTERVAL)
 
 
 if __name__ == "__main__":

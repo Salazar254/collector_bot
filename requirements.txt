@@ -1,6 +1,7 @@
-# ─── collector_bot — Pump.fun token data collection service ───
-# Data collection
+# ─── collector_bot v2 — Snapshot-based pump.fun token data collection ───
+# Core data collection
 supabase>=2.0.0
 requests>=2.31.0
 numpy>=1.26.0
 python-dotenv>=1.0.0
+# CSV export (stdlib csv module used; no additional deps needed)
