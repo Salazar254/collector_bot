@@ -1,7 +1,7 @@
 """
-scripts/cost_monitor.py — Axiom API cost monitoring and reporting.
+scripts/cost_monitor.py — Mobula API cost monitoring and reporting.
 
-Tracks cumulative Axiom API cost per token, per cycle, and total.
+Tracks cumulative Mobula API cost per token, per cycle, and total.
 Reads from axiom_raw_responses table and generates cost summary reports.
 """
 
@@ -23,7 +23,7 @@ DEFAULT_COST_WARNING_MONTHLY = 50.0     # USD
 
 class CostMonitor:
     """
-    Tracks and reports Axiom API costs.
+    Tracks and reports Mobula API costs.
 
     Reads from axiom_raw_responses Supabase table and in-memory counters.
     Generates cost summary reports with per-token and monthly estimates.
@@ -63,8 +63,8 @@ class CostMonitor:
         Record cost for one token collected.
 
         Args:
-            cost_usd: Estimated cost for this token's Axiom API calls
-            axiom_collected: Whether Axiom data was actually collected
+            cost_usd: Estimated cost for this token's Mobula API calls
+            axiom_collected: Whether Mobula data was actually collected
         """
         if axiom_collected:
             self._cycle_tokens += 1

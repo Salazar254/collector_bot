@@ -1,16 +1,19 @@
 """
-scripts/axiom_client.py — Axiom API client with caching, rate limiting, and retry.
+scripts/mobula_client.py — Mobula GraphQL API client with caching, rate limiting, and retry.
 
-Provides wallet intelligence, smart money, whale behavior, and trader quality
-signals from the Axiom API. Designed to be swappable for future providers.
+Provides wallet-intelligence signals via Mobula's filterTokenWallets GraphQL query.
+A single query replaces the 4 fake REST endpoints previously in axiom_client.py.
 
 Architecture:
   - In-memory TTL cache to avoid redundant API calls within a collection window
   - Token bucket rate limiter (configurable RPS)
   - Exponential backoff retry with jitter
   - Raw response storage for cost tracking and debugging
-  - Automatic cost estimation per endpoint
+  - Automatic cost estimation per query
   - Clean error handling — never crashes, returns empty defaults
+
+GraphQL endpoint: https://graphql.mobula.io/graphql
+Auth: Authorization header with API key
 """
 
 import json
@@ -22,7 +25,7 @@ from typing import Any, Optional
 
 import requests
 
-from axiom_config import AxiomConfig, get_axiom_config, reset_axiom_config
+from mobula_config import MobulaConfig, get_mobula_config, reset_mobula_config
 
 log = logging.getLogger(__name__)
 
@@ -107,112 +110,158 @@ class TTLCache:
 
 
 # ===================================================================
-# Axiom API Client
+# GraphQL Query Templates
+# ===================================================================
+
+FILTER_TOKEN_WALLETS_QUERY = """
+query FilterTokenWallets($input: FilterTokenWalletsInput!) {
+  filterTokenWallets(input: $input) {
+    results {
+      address
+      labels
+      firstTransactionAt
+      lastTransactionAt
+      buys1d
+      sells1d
+      sellsAll1d
+      amountBoughtUsd1d
+      amountSoldUsd1d
+      amountSoldUsdAll1d
+      realizedProfitUsd1d
+      realizedProfitPercentage1d
+      buys1w
+      sells1w
+      sellsAll1w
+      amountBoughtUsd1w
+      amountSoldUsd1w
+      amountSoldUsdAll1w
+      realizedProfitUsd1w
+      realizedProfitPercentage1w
+      buys30d
+      sells30d
+      sellsAll30d
+      amountBoughtUsd30d
+      amountSoldUsd30d
+      amountSoldUsdAll30d
+      realizedProfitUsd30d
+      realizedProfitPercentage30d
+      buys1y
+      sells1y
+      sellsAll1y
+      amountBoughtUsd1y
+      amountSoldUsd1y
+      amountSoldUsdAll1y
+      realizedProfitUsd1y
+      realizedProfitPercentage1y
+      tokenBalance
+      tokenBalanceLive
+      tokenBalanceLiveUsd
+      scammerScore
+      botScore
+    }
+    count
+    offset
+  }
+}
+"""
+
+
+# ===================================================================
+# Mobula GraphQL Client
 # ===================================================================
 
 
-class AxiomClient:
+class MobulaClient:
     """
-    Axiom API client with caching, rate limiting, retry, and cost tracking.
+    Mobula GraphQL API client with caching, rate limiting, retry, and cost tracking.
 
-    All public methods return dicts — never raise on API errors.
-    Missing data returns empty dicts with sensible defaults.
+    All public methods return lists/dicts — never raise on API errors.
+    Missing data returns empty lists with sensible defaults.
 
     Usage:
-        client = AxiomClient(config)
-        stats = client.get_token_wallet_stats(mint)
-        smart = client.get_smart_money_activity(mint, window_seconds=900)
+        client = MobulaClient(config)
+        wallets = client.fetch_token_wallets(mint)
     """
+
+    REQUEST_TYPE = "filterTokenWallets"
 
     def __init__(
         self,
-        config: Optional[AxiomConfig] = None,
+        config: Optional[MobulaConfig] = None,
         cache_ttl: Optional[int] = None,
     ) -> None:
-        self._config = config or get_axiom_config()
+        self._config = config or get_mobula_config()
         self._cache = TTLCache(cache_ttl or self._config.cache_ttl_seconds)
         self._bucket = TokenBucket(self._config.rate_limit_rps)
         self._session = requests.Session()
         self._session.headers.update({
-            "Authorization": f"Bearer {self._config.api_key}",
+            "Authorization": self._config.api_key,
             "Content-Type": "application/json",
             "Accept": "application/json",
         })
         self._total_cost: float = 0.0
-        self._request_count: int = 0
+        self._query_count: int = 0
         self._cost_lock = Lock()
 
-        # Default auth headers for all requests
-        self._auth_params: dict[str, str] = {}
-        if self._config.api_key:
-            self._auth_params["api_key"] = self._config.api_key
-
     # ---------------------------------------------------------------
-    # Public API Methods
+    # Public API
     # ---------------------------------------------------------------
 
-    def get_token_wallet_stats(self, mint: str) -> dict[str, Any]:
+    def fetch_token_wallets(
+        self,
+        mint: str,
+        max_pages: int = 5,
+    ) -> list[dict[str, Any]]:
         """
-        Fetch wallet intelligence for all traders of a token.
-        Returns wallet-level stats: age, trade count, win rate, PnL, ROI.
-        """
-        return self._cached_request(
-            "token_wallet_stats",
-            f"{self._config.base_url}/token/{mint}/wallet-stats",
-            params={**self._auth_params},
-        )
+        Fetch all wallets that traded a given token via filterTokenWallets.
 
-    def get_smart_money_activity(
-        self, mint: str, window_seconds: int = 900
-    ) -> dict[str, Any]:
-        """
-        Fetch smart money buy/sell activity for a token within a time window.
-        Uses configured smart money wallet list for classification.
-        """
-        params: dict[str, Any] = {
-            **self._auth_params,
-            "window_seconds": window_seconds,
-        }
-        if self._config.smart_money_wallets:
-            params["wallets"] = ",".join(self._config.smart_money_wallets[:50])
+        Paginates through results (max 200 per page) to collect all wallets.
+        Returns list of TokenWalletResult dicts with labels, windowed stats,
+        PnL, volume, scammer/bot scores.
 
-        return self._cached_request(
-            "smart_money_activity",
-            f"{self._config.base_url}/token/{mint}/smart-money",
-            params=params,
-            cache_key_extra=str(window_seconds),
-        )
+        Args:
+            mint: Solana token mint address
+            max_pages: Maximum number of paginated pages to fetch (5 * 200 = 1000 wallets)
 
-    def get_wallet_profiles(self, wallets: list[str]) -> dict[str, Any]:
+        Returns:
+            List of wallet result dicts. Empty list on failure.
         """
-        Batch-fetch wallet profiles: age, trade count, win rate, PnL, ROI.
-        Max 50 wallets per request.
-        """
-        wallets_batch = wallets[:50]
-        return self._cached_request(
-            "wallet_profiles",
-            f"{self._config.base_url}/wallets/profiles",
-            params={**self._auth_params, "wallets": ",".join(wallets_batch)},
-            cache_key_extra=":".join(sorted(wallets_batch[:10])),
-        )
+        token_id = f"{mint}:{self._config.solana_network_id}"
+        all_wallets: list[dict[str, Any]] = []
+        offset = 0
+        limit = self._config.max_wallets_per_page
 
-    def get_whale_transactions(
-        self, mint: str, threshold_usd: float = 1000.0
-    ) -> dict[str, Any]:
-        """
-        Fetch whale-sized transactions (>= threshold USD) for a token.
-        Used at multiple thresholds: $1K, $5K, $10K.
-        """
-        params: dict[str, Any] = {
-            **self._auth_params,
-            "min_value_usd": threshold_usd,
-        }
-        return self._cached_request(
-            "whale_transactions",
-            f"{self._config.base_url}/token/{mint}/whale-transactions",
-            params=params,
-            cache_key_extra=str(int(threshold_usd)),
-        )
+        for page in range(max_pages):
+            variables = {
+                "input": {
+                    "tokenIds": [token_id],
+                    "limit": limit,
+                    "offset": offset,
+                }
+            }
+
+            result = self._cached_graphql_request(
+                FILTER_TOKEN_WALLETS_QUERY,
+                variables,
+                cache_key_extra=f"{mint}:{offset}",
+            )
+
+            if not result:
+                break
+
+            data = result.get("data", {})
+            ftw = data.get("filterTokenWallets", {})
+            results = ftw.get("results", []) or []
+            count = ftw.get("count", 0)
+
+            all_wallets.extend(results)
+
+            # Stop if we've fetched all wallets
+            offset += len(results)
+            if offset >= count:
+                break
+
+        return all_wallets
 
     # ---------------------------------------------------------------
     # Cost & Stats
@@ -224,50 +273,49 @@ class AxiomClient:
             return self._total_cost
 
     @property
-    def request_count(self) -> int:
+    def query_count(self) -> int:
         with self._cost_lock:
-            return self._request_count
+            return self._query_count
 
     @property
-    def avg_cost_per_request(self) -> float:
+    def avg_cost_per_query(self) -> float:
         with self._cost_lock:
-            if self._request_count == 0:
+            if self._query_count == 0:
                 return 0.0
-            return self._total_cost / self._request_count
+            return self._total_cost / self._query_count
 
     # ---------------------------------------------------------------
-    # Internal — Request Execution
+    # Internal — GraphQL Request Execution
     # ---------------------------------------------------------------
 
-    def _cached_request(
+    def _cached_graphql_request(
         self,
-        request_type: str,
-        url: str,
-        params: Optional[dict[str, Any]] = None,
+        query: str,
+        variables: dict[str, Any],
         cache_key_extra: str = "",
     ) -> dict[str, Any]:
         """
-        Execute a cached API request with rate limiting and retry.
+        Execute a cached GraphQL request with rate limiting and retry.
 
-        Returns parsed JSON dict on success, empty dict on failure.
+        Returns parsed JSON response dict on success, empty dict on failure.
         Never raises — all errors are logged.
         """
-        cache_key = f"{request_type}:{url}:{cache_key_extra}"
+        cache_key = f"{self.REQUEST_TYPE}:{cache_key_extra}"
 
         # Check cache
         cached = self._cache.get(cache_key)
         if cached is not None:
-            log.debug("Axiom cache HIT for %s", request_type)
+            log.debug("Mobula cache HIT for %s", cache_key_extra)
             return cached
 
         # Rate limit
         wait = self._bucket.acquire()
         if wait > 0:
-            log.debug("Axiom rate limit: waiting %.2fs", wait)
+            log.debug("Mobula rate limit: waiting %.2fs", wait)
             time.sleep(wait)
 
         # Execute with retry
-        result = self._retry_request(request_type, url, params)
+        result = self._retry_graphql_request(query, variables, cache_key_extra)
 
         # Cache successful results
         if result:
@@ -275,35 +323,36 @@ class AxiomClient:
 
         return result
 
-    def _retry_request(
+    def _retry_graphql_request(
         self,
-        request_type: str,
-        url: str,
-        params: Optional[dict[str, Any]] = None,
+        query: str,
+        variables: dict[str, Any],
+        context: str = "",
     ) -> dict[str, Any]:
-        """Execute request with exponential backoff retry."""
+        """Execute GraphQL POST with exponential backoff retry."""
         max_retries = self._config.max_retries
         base_wait = 1.0
 
         for attempt in range(max_retries):
             start = time.monotonic()
             try:
-                resp = self._session.get(
-                    url,
-                    params=params,
+                resp = self._session.post(
+                    self._config.graphql_url,
+                    json={"query": query, "variables": variables},
                     timeout=self._config.request_timeout,
                 )
                 latency_ms = int((time.monotonic() - start) * 1000)
 
                 # Track cost
-                cost = AxiomConfig.cost_for_request(request_type)
+                cost = MobulaConfig.cost_for_query()
                 self._track_cost(cost)
 
-                # Store raw response (fire-and-forget for performance)
+                # Store raw response (best-effort)
                 self._store_raw_response(
-                    mint=_extract_mint_from_url(url),
-                    request_type=request_type,
-                    response_data=resp.text if resp.status_code < 500 else None,
+                    mint=_extract_mint_from_context(context),
+                    response_data=(
+                        resp.text if resp.status_code < 500 else None
+                    ),
                     cost_usd=cost,
                     latency_ms=latency_ms,
                     status_code=resp.status_code,
@@ -311,8 +360,8 @@ class AxiomClient:
 
                 if resp.status_code == 429:
                     log.warning(
-                        "Axiom rate limited (429) on %s (attempt %d)",
-                        request_type, attempt + 1,
+                        "Mobula rate limited (429) on %s (attempt %d)",
+                        context, attempt + 1,
                     )
                     wait = base_wait * (2 ** attempt)
                     time.sleep(wait)
@@ -320,39 +369,56 @@ class AxiomClient:
 
                 if resp.status_code >= 500:
                     log.warning(
-                        "Axiom server error %d on %s (attempt %d)",
-                        resp.status_code, request_type, attempt + 1,
+                        "Mobula server error %d on %s (attempt %d)",
+                        resp.status_code, context, attempt + 1,
                     )
                     wait = base_wait * (2 ** attempt)
                     time.sleep(wait)
                     continue
 
                 resp.raise_for_status()
+                body = resp.json()
 
-                data = resp.json()
-                if isinstance(data, dict):
-                    return data
-                return {"data": data}
+                # Check for GraphQL-level errors
+                gql_errors = body.get("errors", [])
+                if gql_errors:
+                    error_msgs = [
+                        e.get("message", str(e)) for e in gql_errors
+                    ]
+                    log.warning(
+                        "Mobula GraphQL errors on %s: %s",
+                        context, "; ".join(error_msgs[:3]),
+                    )
+                    # Non-fatal GraphQL errors — return partial data if available
+                    if body.get("data"):
+                        return body
+                    if attempt < max_retries - 1:
+                        wait = base_wait * (2 ** attempt)
+                        time.sleep(wait)
+                        continue
+                    return {}
+
+                return body
 
             except requests.exceptions.Timeout:
                 log.warning(
-                    "Axiom timeout on %s (attempt %d/%d)",
-                    request_type, attempt + 1, max_retries,
+                    "Mobula timeout on %s (attempt %d/%d)",
+                    context, attempt + 1, max_retries,
                 )
             except requests.exceptions.ConnectionError:
                 log.warning(
-                    "Axiom connection error on %s (attempt %d/%d)",
-                    request_type, attempt + 1, max_retries,
+                    "Mobula connection error on %s (attempt %d/%d)",
+                    context, attempt + 1, max_retries,
                 )
             except requests.exceptions.RequestException as e:
                 log.warning(
-                    "Axiom request error on %s (attempt %d/%d): %s",
-                    request_type, attempt + 1, max_retries, e,
+                    "Mobula request error on %s (attempt %d/%d): %s",
+                    context, attempt + 1, max_retries, e,
                 )
             except Exception:
                 log.exception(
                     "Unexpected error on %s (attempt %d/%d)",
-                    request_type, attempt + 1, max_retries,
+                    context, attempt + 1, max_retries,
                 )
 
             if attempt < max_retries - 1:
@@ -360,8 +426,8 @@ class AxiomClient:
                 time.sleep(wait)
 
         log.error(
-            "Axiom %s failed after %d retries — returning empty result",
-            request_type, max_retries,
+            "Mobula %s failed after %d retries — returning empty result",
+            context, max_retries,
         )
         return {}
 
@@ -369,12 +435,11 @@ class AxiomClient:
         """Increment cost tracking counters."""
         with self._cost_lock:
             self._total_cost += cost_usd
-            self._request_count += 1
+            self._query_count += 1
 
     def _store_raw_response(
         self,
         mint: str,
-        request_type: str,
         response_data: Optional[str],
         cost_usd: float,
         latency_ms: int,
@@ -396,7 +461,7 @@ class AxiomClient:
             client = create_client(supabase_url, supabase_key)
             client.table("axiom_raw_responses").insert({
                 "mint": mint,
-                "request_type": request_type,
+                "request_type": self.REQUEST_TYPE,
                 "response_json": response_data,
                 "cost_usd": cost_usd,
                 "latency_ms": latency_ms,
@@ -421,12 +486,10 @@ class AxiomClient:
 # ===================================================================
 
 
-def _extract_mint_from_url(url: str) -> str:
-    """Extract mint address from Axiom API URL path."""
-    parts = url.split("/")
-    for i, part in enumerate(parts):
-        if part in ("token", "tokens") and i + 1 < len(parts):
-            return parts[i + 1]
+def _extract_mint_from_context(context: str) -> str:
+    """Extract mint address from cache key context (format: 'mint:offset')."""
+    if ":" in context:
+        return context.split(":")[0]
     return "unknown"
 
 
@@ -434,30 +497,30 @@ def _extract_mint_from_url(url: str) -> str:
 # Module-level convenience
 # ===================================================================
 
-_client: Optional[AxiomClient] = None
+_client: Optional[MobulaClient] = None
 _client_lock = Lock()
 
 
-def get_axiom_client() -> Optional[AxiomClient]:
+def get_mobula_client() -> Optional[MobulaClient]:
     """
-    Return the global AxiomClient singleton, or None if Axiom is disabled.
+    Return the global MobulaClient singleton, or None if Mobula is disabled.
     """
     global _client
-    config = get_axiom_config()
+    config = get_mobula_config()
     if not config.is_enabled:
         return None
 
     with _client_lock:
         if _client is None:
-            _client = AxiomClient(config)
+            _client = MobulaClient(config)
         return _client
 
 
-def reset_axiom_client() -> None:
+def reset_mobula_client() -> None:
     """Reset the cached client (useful for testing)."""
     global _client
     with _client_lock:
         if _client:
             _client.close()
             _client = None
-    reset_axiom_config()
+    reset_mobula_config()

@@ -23,9 +23,9 @@ services:
         value: "100"
       - key: PORT
         value: "10000"
-      - key: AXIOM_API_KEY
+      - key: MOBULA_API_KEY
         sync: false
-      - key: AXIOM_ENABLED
+      - key: MOBULA_ENABLED
         value: "true"
-      - key: AXIOM_BASE_URL
-        value: "https://api.axiom.trade/v1"
+      - key: MOBULA_SOLANA_NETWORK_ID
+        value: "1399811149"

@@ -41,7 +41,7 @@ from supabase import create_client, Client
 
 from features import compute_all_features, parse_swaps_for_window
 from quality_validator import QualityValidator, run_quality_check
-from axiom_service import AxiomService, get_axiom_service
+from axiom_service import AxiomService, get_axiom_service  # uses Mobula under the hood
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -59,8 +59,8 @@ log = logging.getLogger(__name__)
 HELIUS_KEY = os.environ["HELIUS_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-AXIOM_API_KEY = os.environ.get("AXIOM_API_KEY", "")
-AXIOM_ENABLED = os.environ.get("AXIOM_ENABLED", "true").lower() == "true" and bool(AXIOM_API_KEY)
+MOBULA_API_KEY = os.environ.get("MOBULA_API_KEY", "")
+AXIOM_ENABLED = os.environ.get("MOBULA_ENABLED", "true").lower() == "true" and bool(MOBULA_API_KEY)
 INTERVAL = int(os.environ.get("COLLECTION_INTERVAL_SECONDS", "10"))
 QUALITY_CHECK_INTERVAL = int(os.environ.get("QUALITY_CHECK_INTERVAL", "100"))
 KEEPALIVE_PORT = int(os.environ.get("PORT", "8080"))
@@ -711,7 +711,7 @@ def main() -> None:
     log.info("========================================")
     log.info("Helius key   : %s", "SET" if HELIUS_KEY else "MISSING")
     log.info("Supabase URL : %s", "SET" if SUPABASE_URL else "MISSING")
-    log.info("Axiom API    : %s", "ENABLED" if AXIOM_ENABLED else "DISABLED")
+    log.info("Mobula API   : %s", "ENABLED" if AXIOM_ENABLED else "DISABLED")
     log.info("Poll interval: %ds", INTERVAL)
     log.info("Quality check: every %d tokens", QUALITY_CHECK_INTERVAL)
     log.info("Snapshots    : T0, T0+1m, T0+5m, T0+15m")
