@@ -318,16 +318,13 @@ def get_assets_batch(mints: list[str]) -> list[dict]:
 
 def get_prices_batch(mints: list[str]) -> dict[str, dict]:
     """
-    Fetches price + liquidity data for up to 30 mints.
-    DexScreener free tier: 300 req/min = 5 req/s.
-    No API key required.
+    Fetches price + liquidity data for up to 30 mints from DexScreener.
+    Free tier — no API key, no strict rate limit on the pairs endpoint.
     Returns dict: mint → price_data.
-    ~0.2 s delay between calls (5 req/s).
     """
     if not mints:
         return {}
 
-    # DexScreener accepts comma-separated addresses
     ids = ",".join(mints[:30])
     url = f"https://api.dexscreener.com/latest/dex/tokens/{ids}"
 
@@ -338,8 +335,8 @@ def get_prices_batch(mints: list[str]) -> dict[str, dict]:
         r.raise_for_status()
         return r.json()
 
-    result = with_retry(fetch)
-    time.sleep(0.2)  # 5 req/s limit
+    result = with_retry(fetch, max_retries=2, base_wait=0.5)
+    # No sleep — DexScreener pairs endpoint has no hard rate limit
 
     if not result:
         return {}
@@ -570,6 +567,41 @@ def compute_labels_dexscreener(
 
 
 # ===================================================================
+# QUALITY FILTER — avoid spending 100 Helius credits on bad tokens
+# ===================================================================
+
+
+def should_fetch_swaps(asset: dict, price_data: dict | None) -> bool:
+    """
+    Only spend 100 credits on swap data for tokens that look promising.
+
+    Returns False for tokens likely to be rugs or with no price history,
+    saving ~75% of monthly credit budget (5x more tokens collected).
+    """
+    # Must have DexScreener data — no price history = skip
+    if not price_data:
+        return False
+
+    # Must have meaningful liquidity (LP not drained yet)
+    if price_data.get("liquidity_usd", 0) < 50:
+        return False
+
+    # Both mint + freeze authority active → immediate rug risk
+    mint_ext = asset.get("mint_extensions", {}) or {}
+    mint_auth = mint_ext.get("mint_authority", "") or ""
+    freeze_auth = mint_ext.get("freeze_authority", "") or ""
+    if mint_auth and freeze_auth:
+        return False
+
+    # Must have valid supply
+    supply = asset.get("supply") or {}
+    if not supply or int(supply.get("supply", "0") or 0) <= 0:
+        return False
+
+    return True
+
+
+# ===================================================================
 # TOKEN PROCESSING PIPELINE
 # ===================================================================
 
@@ -664,23 +696,31 @@ def process_batch(
         chunk = mints[i : i + 30]
         batch_result = get_prices_batch(chunk)
         price_map.update(batch_result)
-        if i + 30 < len(mints):
-            time.sleep(0.2)  # 5 req/s limit
+    # No delay — DexScreener has no strict rate limit on the pairs endpoint
 
-    log.info("  Prices: %d/%d tokens have DexScreener data",
-             len(price_map), len(mints))
+    priced = len(price_map)
+    log.info("  Prices: %d/%d tokens have DexScreener data", priced, len(mints))
 
-    # ── Phase 3: Per-token swaps + build records ──
+    # ── Phase 3: Per-token swaps (skip for low-quality — saves ~75% credits) ──
     records: list[dict] = []
+    fetched_swaps = skipped_swaps = 0
     for mint, graduation_ts, tx_sig in tokens:
         asset = asset_map.get(mint, {})
         price_data = price_map.get(mint)
 
-        # Fetch swap transactions (per-token, 2 req/s)
-        swaps = get_token_swaps(mint, graduation_ts)
+        if should_fetch_swaps(asset, price_data):
+            swaps = get_token_swaps(mint, graduation_ts)
+            fetched_swaps += 1
+        else:
+            swaps = []
+            skipped_swaps += 1
 
         record = build_record(mint, graduation_ts, tx_sig, asset, swaps, price_data)
         records.append(record)
+
+    if skipped_swaps:
+        log.info("  Swaps: %d fetched, %d skipped (saves %d credits)",
+                 fetched_swaps, skipped_swaps, skipped_swaps * 100)
 
     # ── Phase 4: Save to Supabase ──
     saved = save_batch(records)
