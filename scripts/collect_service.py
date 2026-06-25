@@ -434,7 +434,7 @@ def compute_features(
 
     # ---- Initial liquidity from first swap ----
     first_ev = swaps[0].get("events", {}).get("swap", {})
-    native_in = (first_ev.get("nativeInput") or {}).get("amount", 0) or 0
+    native_in = int((first_ev.get("nativeInput") or {}).get("amount", 0) or 0)
     pool_sol = abs(native_in) / 1e9
     features["initial_liquidity_sol"] = min(pool_sol / 1000, 1.0)
 
@@ -456,13 +456,15 @@ def compute_features(
             nat_out = (ev.get("nativeOutput") or {})
             tok_out = ev.get("tokenOutputs", [{}])
 
-            sol_in = nat_in.get("amount", 0) / 1e9
+            in_amt = int(nat_in.get("amount", 0) or 0)
+            out_amt = int(nat_out.get("amount", 0) or 0)
+            sol_in = in_amt / 1e9
 
-            if nat_in.get("amount", 0):
+            if in_amt:
                 buyers.add(signer)
-                buy_vol += nat_in["amount"]
-            if nat_out.get("amount", 0):
-                sell_vol += nat_out["amount"]
+                buy_vol += in_amt
+            if out_amt:
+                sell_vol += out_amt
 
             tok_amt = float(tok_out[0].get("tokenAmount", 0)) if tok_out else 0
             if tok_amt > 0:
@@ -490,15 +492,15 @@ def compute_features(
     for i, swap in enumerate(swaps[:SEQUENCE_LENGTH]):
         ev = swap.get("events", {}).get("swap", {})
         signer = swap.get("feePayer", "")
-        nat_in = (ev.get("nativeInput") or {}).get("amount", 0) or 0
-        nat_out = (ev.get("nativeOutput") or {}).get("amount", 0) or 0
+        seq_in = int((ev.get("nativeInput") or {}).get("amount", 0) or 0)
+        seq_out = int((ev.get("nativeOutput") or {}).get("amount", 0) or 0)
 
-        sol_in = nat_in / 1e9
-        if nat_in:
+        sol_in = seq_in / 1e9
+        if seq_in:
             seq_buyers.add(signer)
-            seq_buy_vol += nat_in
-        if nat_out:
-            seq_sell_vol += nat_out
+            seq_buy_vol += seq_in
+        if seq_out:
+            seq_sell_vol += seq_out
 
         total_nat = seq_buy_vol + seq_sell_vol
         sequence.append([
