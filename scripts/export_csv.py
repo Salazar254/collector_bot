@@ -103,10 +103,158 @@ CSV_COLUMNS: list[str] = [
     "volatility_15m",
     "drawdown_first_15m",
 
-    # LABELS (5)
+    # SMART_MONEY (12)
+    "smart_wallet_buyers_1m",
+    "smart_wallet_buyers_5m",
+    "smart_wallet_buyers_15m",
+    "smart_wallet_volume_1m",
+    "smart_wallet_volume_5m",
+    "smart_wallet_volume_15m",
+    "smart_wallet_percentage",
+    "smart_money_first_buyer",
+    "first_smart_money_buy_timestamp",
+    "smart_money_within_first_minute",
+    "smart_money_within_first_5m",
+    "smart_money_accumulation_rate",
+
+    # WALLET_QUALITY (10)
+    "avg_wallet_age_days",
+    "median_wallet_age_days",
+    "avg_wallet_trade_count",
+    "median_wallet_trade_count",
+    "avg_wallet_win_rate",
+    "median_wallet_win_rate",
+    "avg_wallet_realized_pnl",
+    "median_wallet_realized_pnl",
+    "avg_wallet_roi",
+    "median_wallet_roi",
+
+    # PNL (10)
+    "avg_buyer_pnl_30d",
+    "median_buyer_pnl_30d",
+    "top_buyer_pnl_30d",
+    "avg_buyer_pnl_90d",
+    "median_buyer_pnl_90d",
+    "top_buyer_pnl_90d",
+    "avg_seller_pnl_30d",
+    "median_seller_pnl_30d",
+    "avg_seller_pnl_90d",
+    "median_seller_pnl_90d",
+
+    # ROI (6)
+    "avg_buyer_roi_30d",
+    "median_buyer_roi_30d",
+    "top_buyer_roi_30d",
+    "avg_buyer_roi_90d",
+    "median_buyer_roi_90d",
+    "top_buyer_roi_90d",
+
+    # PROFITABLE_TRADER (8)
+    "profitable_wallet_count",
+    "profitable_wallet_buy_volume",
+    "high_roi_wallet_count",
+    "elite_trader_count",
+    "wallets_with_positive_pnl",
+    "wallets_above_20pct_roi",
+    "wallets_above_50pct_roi",
+    "wallets_above_100pct_roi",
+
+    # WHALE_AXIOM — 1K (8)
+    "largest_buy_usd_1k",
+    "largest_sell_usd_1k",
+    "whale_buy_count_1k",
+    "whale_sell_count_1k",
+    "whale_buy_volume_1k",
+    "whale_sell_volume_1k",
+    "whale_net_flow_1k",
+    "whale_accumulation_rate_1k",
+
+    # WHALE_AXIOM — 5K (8)
+    "largest_buy_usd_5k",
+    "largest_sell_usd_5k",
+    "whale_buy_count_5k",
+    "whale_sell_count_5k",
+    "whale_buy_volume_5k",
+    "whale_sell_volume_5k",
+    "whale_net_flow_5k",
+    "whale_accumulation_rate_5k",
+
+    # WHALE_AXIOM — 10K (8)
+    "largest_buy_usd_10k",
+    "largest_sell_usd_10k",
+    "whale_buy_count_10k",
+    "whale_sell_count_10k",
+    "whale_buy_volume_10k",
+    "whale_sell_volume_10k",
+    "whale_net_flow_10k",
+    "whale_accumulation_rate_10k",
+
+    # BUYER_QUALITY (5)
+    "new_wallet_buyers",
+    "experienced_wallet_buyers",
+    "wallets_older_than_30_days",
+    "wallets_older_than_90_days",
+    "wallets_older_than_180_days",
+
+    # CONVICTION (6)
+    "repeat_buyers",
+    "multi_buy_wallets",
+    "wallet_rebuy_rate",
+    "wallet_accumulation_rate",
+    "avg_buys_per_wallet",
+    "median_buys_per_wallet",
+
+    # EARLY_STRENGTH (7)
+    "first_buyer_win_rate",
+    "first_5_buyers_avg_win_rate",
+    "first_10_buyers_avg_win_rate",
+    "first_20_buyers_avg_win_rate",
+    "first_5_buyers_avg_pnl",
+    "first_10_buyers_avg_pnl",
+    "first_20_buyers_avg_pnl",
+
+    # DISTRIBUTION (5)
+    "top_wallet_buy_share",
+    "top5_wallet_buy_share",
+    "top10_wallet_buy_share",
+    "top20_wallet_buy_share",
+    "buyer_concentration_index",
+
+    # RISK_SIGNALS (6)
+    "dumping_wallet_count",
+    "wallets_sold_within_5m",
+    "wallets_sold_within_15m",
+    "wallets_sold_within_60m",
+    "fast_exit_rate",
+    "paper_hand_rate",
+
+    # SMART_VS_RETAIL (5)
+    "smart_money_volume_share",
+    "smart_money_buy_share",
+    "retail_buy_share",
+    "retail_sell_share",
+    "smart_money_net_flow",
+
+    # COMPOSITE (5)
+    "smart_money_score",
+    "wallet_quality_score",
+    "whale_score",
+    "conviction_score",
+    "buyer_quality_score",
+
+    # AXIOM META (2)
+    "axiom_collected",
+    "axiom_cost_usd",
+
+    # LABELS (10)
+    "did_1_25x",
+    "did_1_5x",
     "did_2x",
+    "did_3x",
     "did_5x",
     "did_10x",
+    "rugged",
+    "survived_24h",
     "max_drawdown_pct",
     "inferred_label",
 ]
@@ -133,7 +281,31 @@ for col in CSV_COLUMNS:
         ONNX_DTYPE_MAP[col] = "string"
     elif col.endswith("_count") or col.startswith("unique_") or col.startswith("holder_count"):
         ONNX_DTYPE_MAP[col] = "int32"
+    elif col.startswith("smart_wallet_buyers") or col.startswith("smart_money_first"):
+        ONNX_DTYPE_MAP[col] = "int32"
+    elif col.startswith("smart_money_within") or col.startswith("first_smart_money"):
+        ONNX_DTYPE_MAP[col] = "int32"
+    elif col in ("smart_money_first_buyer",):
+        ONNX_DTYPE_MAP[col] = "int32"
+    elif col.startswith("profitable_") or col.startswith("high_roi_") or col.startswith("elite_"):
+        ONNX_DTYPE_MAP[col] = "int32"
+    elif col.startswith("wallets_") and ("_roi" in col or "_pnl" in col):
+        ONNX_DTYPE_MAP[col] = "int32"
+    elif col.startswith("whale_buy_count") or col.startswith("whale_sell_count"):
+        ONNX_DTYPE_MAP[col] = "int32"
+    elif col in ("new_wallet_buyers", "experienced_wallet_buyers"):
+        ONNX_DTYPE_MAP[col] = "int32"
+    elif col.startswith("wallets_older_"):
+        ONNX_DTYPE_MAP[col] = "int32"
+    elif col in ("repeat_buyers", "multi_buy_wallets"):
+        ONNX_DTYPE_MAP[col] = "int32"
+    elif col.startswith("dumping_") or col.startswith("wallets_sold_"):
+        ONNX_DTYPE_MAP[col] = "int32"
+    elif col == "axiom_collected":
+        ONNX_DTYPE_MAP[col] = "int32"
     elif col.startswith("did_"):
+        ONNX_DTYPE_MAP[col] = "int32"
+    elif col in ("rugged", "survived_24h"):
         ONNX_DTYPE_MAP[col] = "int32"
     elif col == "inferred_label":
         ONNX_DTYPE_MAP[col] = "int32"
@@ -207,6 +379,11 @@ def row_to_csv(row: dict[str, Any]) -> dict[str, Any]:
             elif any(csv_col.startswith(p) for p in (
                 "did_", "unique_", "buy_count", "sell_count",
                 "holder_count", "whale_buy_count", "whale_sell_count",
+                "smart_wallet_buyers", "smart_money_within", "smart_money_first",
+                "profitable_wallet", "high_roi_wallet", "elite_trader",
+                "wallets_", "new_wallet", "experienced_wallet",
+                "repeat_buyers", "multi_buy_wallets",
+                "dumping_wallet", "wallets_sold",
             )):
                 val = 0
             elif csv_col == "inferred_label":
@@ -267,7 +444,8 @@ def export_for_onnx(
     meta_path = output_path.replace(".csv", ".meta.json")
 
     # Build label columns list (targets for ONNX)
-    label_cols = ["did_2x", "did_5x", "did_10x", "max_drawdown_pct"]
+    label_cols = ["did_1_25x", "did_1_5x", "did_2x", "did_3x", "did_5x", "did_10x",
+                  "rugged", "survived_24h", "max_drawdown_pct"]
     feature_cols = [c for c in CSV_COLUMNS if c not in label_cols
                     and c not in ("mint_address", "symbol", "migration_timestamp",
                                   "collected_at", "inferred_label")]

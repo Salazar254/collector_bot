@@ -23,3 +23,9 @@ services:
         value: "100"
       - key: PORT
         value: "10000"
+      - key: AXIOM_API_KEY
+        sync: false
+      - key: AXIOM_ENABLED
+        value: "true"
+      - key: AXIOM_BASE_URL
+        value: "https://api.axiom.trade/v1"

@@ -98,11 +98,191 @@ CREATE TABLE IF NOT EXISTS training_tokens (
   drawdown_first_15m     FLOAT4,   -- max(0, (max_price - min_price) / max_price) * 100
 
   -- =======================================================================
+  -- SMART MONEY (12 features, source: Axiom)
+  -- =======================================================================
+  smart_wallet_buyers_1m            INT4,
+  smart_wallet_buyers_5m            INT4,
+  smart_wallet_buyers_15m           INT4,
+  smart_wallet_volume_1m            FLOAT4,
+  smart_wallet_volume_5m            FLOAT4,
+  smart_wallet_volume_15m           FLOAT4,
+  smart_wallet_percentage           FLOAT4,
+  smart_money_first_buyer           SMALLINT DEFAULT 0,
+  first_smart_money_buy_timestamp   BIGINT,
+  smart_money_within_first_minute   INT4,
+  smart_money_within_first_5m       INT4,
+  smart_money_accumulation_rate     FLOAT4,
+
+  -- =======================================================================
+  -- WALLET QUALITY (10 features, source: Axiom)
+  -- =======================================================================
+  avg_wallet_age_days               FLOAT4,
+  median_wallet_age_days            FLOAT4,
+  avg_wallet_trade_count            FLOAT4,
+  median_wallet_trade_count         FLOAT4,
+  avg_wallet_win_rate               FLOAT4,
+  median_wallet_win_rate            FLOAT4,
+  avg_wallet_realized_pnl           FLOAT4,
+  median_wallet_realized_pnl        FLOAT4,
+  avg_wallet_roi                    FLOAT4,
+  median_wallet_roi                 FLOAT4,
+
+  -- =======================================================================
+  -- PNL (10 features, source: Axiom)
+  -- =======================================================================
+  avg_buyer_pnl_30d                 FLOAT4,
+  median_buyer_pnl_30d              FLOAT4,
+  top_buyer_pnl_30d                 FLOAT4,
+  avg_buyer_pnl_90d                 FLOAT4,
+  median_buyer_pnl_90d              FLOAT4,
+  top_buyer_pnl_90d                 FLOAT4,
+  avg_seller_pnl_30d                FLOAT4,
+  median_seller_pnl_30d             FLOAT4,
+  avg_seller_pnl_90d                FLOAT4,
+  median_seller_pnl_90d             FLOAT4,
+
+  -- =======================================================================
+  -- ROI (6 features, source: Axiom)
+  -- =======================================================================
+  avg_buyer_roi_30d                 FLOAT4,
+  median_buyer_roi_30d              FLOAT4,
+  top_buyer_roi_30d                 FLOAT4,
+  avg_buyer_roi_90d                 FLOAT4,
+  median_buyer_roi_90d              FLOAT4,
+  top_buyer_roi_90d                 FLOAT4,
+
+  -- =======================================================================
+  -- PROFITABLE TRADER METRICS (8 features, source: Axiom)
+  -- =======================================================================
+  profitable_wallet_count           INT4,
+  profitable_wallet_buy_volume      FLOAT4,
+  high_roi_wallet_count             INT4,
+  elite_trader_count                INT4,
+  wallets_with_positive_pnl         INT4,
+  wallets_above_20pct_roi           INT4,
+  wallets_above_50pct_roi           INT4,
+  wallets_above_100pct_roi          INT4,
+
+  -- =======================================================================
+  -- WHALE AXIOM — $1,000 threshold (8 features, source: Axiom)
+  -- =======================================================================
+  largest_buy_usd_1k                FLOAT4,
+  largest_sell_usd_1k               FLOAT4,
+  whale_buy_count_1k                INT4,
+  whale_sell_count_1k               INT4,
+  whale_buy_volume_1k               FLOAT4,
+  whale_sell_volume_1k              FLOAT4,
+  whale_net_flow_1k                 FLOAT4,
+  whale_accumulation_rate_1k        FLOAT4,
+
+  -- =======================================================================
+  -- WHALE AXIOM — $5,000 threshold (8 features, source: Axiom)
+  -- =======================================================================
+  largest_buy_usd_5k                FLOAT4,
+  largest_sell_usd_5k               FLOAT4,
+  whale_buy_count_5k                INT4,
+  whale_sell_count_5k               INT4,
+  whale_buy_volume_5k               FLOAT4,
+  whale_sell_volume_5k              FLOAT4,
+  whale_net_flow_5k                 FLOAT4,
+  whale_accumulation_rate_5k        FLOAT4,
+
+  -- =======================================================================
+  -- WHALE AXIOM — $10,000 threshold (8 features, source: Axiom)
+  -- =======================================================================
+  largest_buy_usd_10k               FLOAT4,
+  largest_sell_usd_10k              FLOAT4,
+  whale_buy_count_10k               INT4,
+  whale_sell_count_10k              INT4,
+  whale_buy_volume_10k              FLOAT4,
+  whale_sell_volume_10k             FLOAT4,
+  whale_net_flow_10k                FLOAT4,
+  whale_accumulation_rate_10k       FLOAT4,
+
+  -- =======================================================================
+  -- BUYER QUALITY (5 features, source: Axiom)
+  -- =======================================================================
+  new_wallet_buyers                 INT4,
+  experienced_wallet_buyers         INT4,
+  wallets_older_than_30_days        INT4,
+  wallets_older_than_90_days        INT4,
+  wallets_older_than_180_days       INT4,
+
+  -- =======================================================================
+  -- CONVICTION SIGNALS (6 features, source: Axiom)
+  -- =======================================================================
+  repeat_buyers                     INT4,
+  multi_buy_wallets                 INT4,
+  wallet_rebuy_rate                 FLOAT4,
+  wallet_accumulation_rate          FLOAT4,
+  avg_buys_per_wallet               FLOAT4,
+  median_buys_per_wallet            FLOAT4,
+
+  -- =======================================================================
+  -- EARLY STRENGTH (7 features, source: Axiom)
+  -- =======================================================================
+  first_buyer_win_rate              FLOAT4,
+  first_5_buyers_avg_win_rate       FLOAT4,
+  first_10_buyers_avg_win_rate      FLOAT4,
+  first_20_buyers_avg_win_rate      FLOAT4,
+  first_5_buyers_avg_pnl            FLOAT4,
+  first_10_buyers_avg_pnl           FLOAT4,
+  first_20_buyers_avg_pnl           FLOAT4,
+
+  -- =======================================================================
+  -- DISTRIBUTION (5 features, source: Axiom)
+  -- =======================================================================
+  top_wallet_buy_share              FLOAT4,
+  top5_wallet_buy_share             FLOAT4,
+  top10_wallet_buy_share            FLOAT4,
+  top20_wallet_buy_share            FLOAT4,
+  buyer_concentration_index         FLOAT4,
+
+  -- =======================================================================
+  -- RISK SIGNALS (6 features, source: Axiom)
+  -- =======================================================================
+  dumping_wallet_count              INT4,
+  wallets_sold_within_5m            INT4,
+  wallets_sold_within_15m           INT4,
+  wallets_sold_within_60m           INT4,
+  fast_exit_rate                    FLOAT4,
+  paper_hand_rate                   FLOAT4,
+
+  -- =======================================================================
+  -- SMART MONEY vs RETAIL (5 features, source: Axiom)
+  -- =======================================================================
+  smart_money_volume_share          FLOAT4,
+  smart_money_buy_share             FLOAT4,
+  retail_buy_share                  FLOAT4,
+  retail_sell_share                 FLOAT4,
+  smart_money_net_flow              FLOAT4,
+
+  -- =======================================================================
+  -- COMPOSITE SCORES (5 features, source: Axiom — engineered)
+  -- =======================================================================
+  smart_money_score                 FLOAT4,
+  wallet_quality_score              FLOAT4,
+  whale_score                       FLOAT4,
+  conviction_score                  FLOAT4,
+  buyer_quality_score               FLOAT4,
+
+  -- =======================================================================
+  -- AXIOM METADATA
+  -- =======================================================================
+  axiom_collected         BOOLEAN DEFAULT FALSE,  -- true if Axiom data collected
+  axiom_cost_usd          FLOAT4 DEFAULT 0.0,     -- estimated Axiom API cost for this token
+
+  -- =======================================================================
   -- LABELS (profit-tier targets from DexScreener price_change_24h)
   -- =======================================================================
+  did_1_25x              SMALLINT DEFAULT 0,   -- price_change_24h >= 25%
+  did_1_5x               SMALLINT DEFAULT 0,   -- price_change_24h >= 50%
   did_2x                 SMALLINT DEFAULT 0,   -- price_change_24h >= 100%
+  did_3x                 SMALLINT DEFAULT 0,   -- price_change_24h >= 200%
   did_5x                 SMALLINT DEFAULT 0,   -- price_change_24h >= 400%
   did_10x                SMALLINT DEFAULT 0,   -- price_change_24h >= 900%
+  rugged                 SMALLINT DEFAULT 0,   -- price_change_24h <= -80% OR liquidity < $10
+  survived_24h           SMALLINT DEFAULT 0,   -- liquidity >= $10 AND pair still alive after 24h
   max_drawdown_pct       FLOAT4,               -- worst observed drawdown
   inferred_label         BOOLEAN DEFAULT FALSE, -- true if labels were computed
 
@@ -117,12 +297,26 @@ CREATE TABLE IF NOT EXISTS training_tokens (
 -- =======================================================================
 CREATE INDEX IF NOT EXISTS idx_graduation_ts
   ON training_tokens(graduation_timestamp);
+CREATE INDEX IF NOT EXISTS idx_did_1_25x
+  ON training_tokens(did_1_25x);
+CREATE INDEX IF NOT EXISTS idx_did_1_5x
+  ON training_tokens(did_1_5x);
 CREATE INDEX IF NOT EXISTS idx_did_2x
   ON training_tokens(did_2x);
+CREATE INDEX IF NOT EXISTS idx_did_3x
+  ON training_tokens(did_3x);
 CREATE INDEX IF NOT EXISTS idx_did_5x
   ON training_tokens(did_5x);
+CREATE INDEX IF NOT EXISTS idx_did_10x
+  ON training_tokens(did_10x);
+CREATE INDEX IF NOT EXISTS idx_rugged
+  ON training_tokens(rugged);
+CREATE INDEX IF NOT EXISTS idx_survived_24h
+  ON training_tokens(survived_24h);
 CREATE INDEX IF NOT EXISTS idx_collected_at
   ON training_tokens(collected_at);
+CREATE INDEX IF NOT EXISTS idx_axiom_collected
+  ON training_tokens(axiom_collected);
 
 -- Allow the service role to insert/update (RLS is on by default)
 ALTER TABLE training_tokens ENABLE ROW LEVEL SECURITY;

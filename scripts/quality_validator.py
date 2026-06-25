@@ -56,11 +56,120 @@ NUMERIC_FEATURES: list[str] = [
     # VOLATILITY (4)
     "volatility_1m", "volatility_5m", "volatility_15m",
     "drawdown_first_15m",
+    # SMART_MONEY (12)
+    "smart_wallet_buyers_1m", "smart_wallet_buyers_5m", "smart_wallet_buyers_15m",
+    "smart_wallet_volume_1m", "smart_wallet_volume_5m", "smart_wallet_volume_15m",
+    "smart_wallet_percentage", "smart_money_first_buyer",
+    "first_smart_money_buy_timestamp",
+    "smart_money_within_first_minute", "smart_money_within_first_5m",
+    "smart_money_accumulation_rate",
+    # WALLET_QUALITY (10)
+    "avg_wallet_age_days", "median_wallet_age_days",
+    "avg_wallet_trade_count", "median_wallet_trade_count",
+    "avg_wallet_win_rate", "median_wallet_win_rate",
+    "avg_wallet_realized_pnl", "median_wallet_realized_pnl",
+    "avg_wallet_roi", "median_wallet_roi",
+    # PNL (10)
+    "avg_buyer_pnl_30d", "median_buyer_pnl_30d", "top_buyer_pnl_30d",
+    "avg_buyer_pnl_90d", "median_buyer_pnl_90d", "top_buyer_pnl_90d",
+    "avg_seller_pnl_30d", "median_seller_pnl_30d",
+    "avg_seller_pnl_90d", "median_seller_pnl_90d",
+    # ROI (6)
+    "avg_buyer_roi_30d", "median_buyer_roi_30d", "top_buyer_roi_30d",
+    "avg_buyer_roi_90d", "median_buyer_roi_90d", "top_buyer_roi_90d",
+    # PROFITABLE_TRADER (8)
+    "profitable_wallet_count", "profitable_wallet_buy_volume",
+    "high_roi_wallet_count", "elite_trader_count",
+    "wallets_with_positive_pnl",
+    "wallets_above_20pct_roi", "wallets_above_50pct_roi", "wallets_above_100pct_roi",
+    # WHALE_AXIOM — 1K (8)
+    "largest_buy_usd_1k", "largest_sell_usd_1k",
+    "whale_buy_count_1k", "whale_sell_count_1k",
+    "whale_buy_volume_1k", "whale_sell_volume_1k",
+    "whale_net_flow_1k", "whale_accumulation_rate_1k",
+    # WHALE_AXIOM — 5K (8)
+    "largest_buy_usd_5k", "largest_sell_usd_5k",
+    "whale_buy_count_5k", "whale_sell_count_5k",
+    "whale_buy_volume_5k", "whale_sell_volume_5k",
+    "whale_net_flow_5k", "whale_accumulation_rate_5k",
+    # WHALE_AXIOM — 10K (8)
+    "largest_buy_usd_10k", "largest_sell_usd_10k",
+    "whale_buy_count_10k", "whale_sell_count_10k",
+    "whale_buy_volume_10k", "whale_sell_volume_10k",
+    "whale_net_flow_10k", "whale_accumulation_rate_10k",
+    # BUYER_QUALITY (5)
+    "new_wallet_buyers", "experienced_wallet_buyers",
+    "wallets_older_than_30_days", "wallets_older_than_90_days",
+    "wallets_older_than_180_days",
+    # CONVICTION (6)
+    "repeat_buyers", "multi_buy_wallets",
+    "wallet_rebuy_rate", "wallet_accumulation_rate",
+    "avg_buys_per_wallet", "median_buys_per_wallet",
+    # EARLY_STRENGTH (7)
+    "first_buyer_win_rate",
+    "first_5_buyers_avg_win_rate", "first_10_buyers_avg_win_rate",
+    "first_20_buyers_avg_win_rate",
+    "first_5_buyers_avg_pnl", "first_10_buyers_avg_pnl",
+    "first_20_buyers_avg_pnl",
+    # DISTRIBUTION (5)
+    "top_wallet_buy_share", "top5_wallet_buy_share",
+    "top10_wallet_buy_share", "top20_wallet_buy_share",
+    "buyer_concentration_index",
+    # RISK_SIGNALS (6)
+    "dumping_wallet_count",
+    "wallets_sold_within_5m", "wallets_sold_within_15m",
+    "wallets_sold_within_60m",
+    "fast_exit_rate", "paper_hand_rate",
+    # SMART_VS_RETAIL (5)
+    "smart_money_volume_share", "smart_money_buy_share",
+    "retail_buy_share", "retail_sell_share",
+    "smart_money_net_flow",
+    # COMPOSITE (5)
+    "smart_money_score", "wallet_quality_score",
+    "whale_score", "conviction_score", "buyer_quality_score",
 ]
 
 FEATURE_CATEGORY_MAP: dict[str, str] = {}
 for f in NUMERIC_FEATURES:
-    if f.startswith("price"):
+    if f.startswith("smart_wallet") or f.startswith("smart_money") or f.startswith("first_smart_money"):
+        FEATURE_CATEGORY_MAP[f] = "SMART_MONEY"
+    elif f.startswith("avg_wallet") or f.startswith("median_wallet"):
+        FEATURE_CATEGORY_MAP[f] = "WALLET_QUALITY"
+    elif (f.startswith("avg_buyer_pnl") or f.startswith("median_buyer_pnl") or
+          f.startswith("top_buyer_pnl") or f.startswith("avg_seller_pnl") or
+          f.startswith("median_seller_pnl")):
+        FEATURE_CATEGORY_MAP[f] = "PNL"
+    elif (f.startswith("avg_buyer_roi") or f.startswith("median_buyer_roi") or
+          f.startswith("top_buyer_roi")):
+        FEATURE_CATEGORY_MAP[f] = "ROI"
+    elif f.startswith("profitable") or f.startswith("high_roi") or \
+         f.startswith("elite") or f.startswith("wallets_"):
+        FEATURE_CATEGORY_MAP[f] = "PROFITABLE_TRADER"
+    elif f.endswith("_1k") or f.endswith("_5k") or f.endswith("_10k"):
+        FEATURE_CATEGORY_MAP[f] = "WHALE_AXIOM"
+    elif f.startswith("new_wallet") or f.startswith("experienced") or \
+         f.startswith("wallets_older"):
+        FEATURE_CATEGORY_MAP[f] = "BUYER_QUALITY"
+    elif f.startswith("repeat") or f.startswith("multi_buy") or \
+         f.startswith("wallet_rebuy") or f.startswith("wallet_accumulation") or \
+         f.endswith("buys_per_wallet"):
+        FEATURE_CATEGORY_MAP[f] = "CONVICTION"
+    elif f.startswith("first_") or f.startswith("first_5") or \
+         f.startswith("first_10") or f.startswith("first_20"):
+        FEATURE_CATEGORY_MAP[f] = "EARLY_STRENGTH"
+    elif f.startswith("top") or f.startswith("top5") or f.startswith("top10") or \
+         f.startswith("top20") or f.startswith("buyer_concentration"):
+        FEATURE_CATEGORY_MAP[f] = "DISTRIBUTION"
+    elif f.startswith("dumping") or f.startswith("wallets_sold") or \
+         f.startswith("fast_exit") or f.startswith("paper_hand"):
+        FEATURE_CATEGORY_MAP[f] = "RISK_SIGNALS"
+    elif f.startswith("smart_money_") and (f.endswith("_share") or f.endswith("_flow")):
+        FEATURE_CATEGORY_MAP[f] = "SMART_VS_RETAIL"
+    elif f.startswith("retail_"):
+        FEATURE_CATEGORY_MAP[f] = "SMART_VS_RETAIL"
+    elif f.endswith("_score"):
+        FEATURE_CATEGORY_MAP[f] = "COMPOSITE"
+    elif f.startswith("price"):
         FEATURE_CATEGORY_MAP[f] = "PRICE"
     elif f.startswith("liquidity"):
         FEATURE_CATEGORY_MAP[f] = "LIQUIDITY"
@@ -85,6 +194,7 @@ for f in NUMERIC_FEATURES:
 
 UNIQUE_RATIO_THRESHOLD = 0.05   # flag if < 5%
 VARIANCE_EPSILON = 1e-8         # flag if variance ≈ 0
+MISSING_RATE_THRESHOLD = 50.0   # flag if missing_rate > 50%
 
 
 # ===================================================================
@@ -169,7 +279,10 @@ class QualityValidator:
             flagged = False
             flag_reason: Optional[str] = None
 
-            if unique_ratio < UNIQUE_RATIO_THRESHOLD and total >= 10:
+            if missing_pct > MISSING_RATE_THRESHOLD and total >= 10:
+                flagged = True
+                flag_reason = "high_missing_rate"
+            elif unique_ratio < UNIQUE_RATIO_THRESHOLD and total >= 10:
                 flagged = True
                 flag_reason = "low_uniqueness"
             elif variance < VARIANCE_EPSILON and total >= 10:

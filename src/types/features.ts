@@ -163,9 +163,14 @@ export interface TokenFeatures
 // =========================================================================
 
 export interface TokenLabels {
+  did_1_25x: number;             // int32 — 1 if price_change_24h ≥ 25%
+  did_1_5x: number;              // int32 — 1 if price_change_24h ≥ 50%
   did_2x: number;                // int32 — 1 if price_change_24h ≥ 100%
+  did_3x: number;                // int32 — 1 if price_change_24h ≥ 200%
   did_5x: number;                // int32 — 1 if price_change_24h ≥ 400%
   did_10x: number;               // int32 — 1 if price_change_24h ≥ 900%
+  rugged: number;                // int32 — 1 if price_change_24h ≤ -80% OR liquidity < $10
+  survived_24h: number;          // int32 — 1 if liquidity ≥ $10 AND pair still alive after 24h
   max_drawdown_pct: number;      // float32 — worst observed drawdown
   inferred_label: number;        // int32 — 1 if labels were computed (vs fallback 0)
 }
@@ -174,7 +179,14 @@ export interface TokenLabels {
 // Full snapshot record (stored in Supabase)
 // =========================================================================
 
-export interface TokenSnapshot extends TokenIdentity, TokenFeatures, TokenLabels {
+import type { AxiomFeatures, AxiomMetadata } from "./axiom_features";
+
+export interface TokenSnapshot
+  extends TokenIdentity,
+    TokenFeatures,
+    AxiomFeatures,
+    AxiomMetadata,
+    TokenLabels {
   collected_at: string;          // ISO 8601 timestamp
   deployer_address: string;
 }
@@ -190,8 +202,8 @@ export interface FeatureQualityFlag {
   unique_count: number;          // number of distinct values
   unique_ratio: number;          // unique_count / total_rows
   variance: number;              // population variance
-  flagged: boolean;              // true if unique_ratio < 0.05 or variance ≈ 0
-  flag_reason: string | null;    // "low_uniqueness" | "zero_variance" | null
+  flagged: boolean;              // true if unique_ratio < 0.05 or variance ≈ 0 or missing_rate > 50%
+  flag_reason: string | null;    // "low_uniqueness" | "zero_variance" | "high_missing_rate" | null
 }
 
 export interface QualityReport {
@@ -211,17 +223,32 @@ export interface QualityReport {
  *   1. mint_address
  *   2. symbol
  *   3. migration_timestamp
- *   4-12.  PRICE (9 cols)
- *   13-18. LIQUIDITY (6 cols)
- *   19-21. VOLUME (3 cols)
- *   22-25. BUYERS (4 cols)
- *   26-29. SELLERS (4 cols)
- *   30-39. ORDER FLOW (10 cols)
- *   40-44. HOLDERS (5 cols)
- *   45-49. WHALES (5 cols)
- *   50-53. VOLATILITY (4 cols)
- *   54-58. LABELS (5 cols)
+ *   4. collected_at
+ *   5-13.  PRICE (9 cols)
+ *   14-19. LIQUIDITY (6 cols)
+ *   20-22. VOLUME (3 cols)
+ *   23-26. BUYERS (4 cols)
+ *   27-30. SELLERS (4 cols)
+ *   31-40. ORDER FLOW (10 cols)
+ *   41-45. HOLDERS (5 cols)
+ *   46-50. WHALES (5 cols)
+ *   51-54. VOLATILITY (4 cols)
+ *   55-66.  SMART_MONEY (12 cols)
+ *   67-76.  WALLET_QUALITY (10 cols)
+ *   77-86.  PNL (10 cols)
+ *   87-92.  ROI (6 cols)
+ *   93-100. PROFITABLE_TRADER (8 cols)
+ *   101-124. WHALE_AXIOM (24 cols)
+ *   125-129. BUYER_QUALITY (5 cols)
+ *   130-135. CONVICTION (6 cols)
+ *   136-142. EARLY_STRENGTH (7 cols)
+ *   143-147. DISTRIBUTION (5 cols)
+ *   148-153. RISK_SIGNALS (6 cols)
+ *   154-158. SMART_VS_RETAIL (5 cols)
+ *   159-163. COMPOSITE (5 cols)
+ *   164-165. AXIOM META (2 cols)
+ *   166-175. LABELS (10 cols)
  */
-export interface CSVExportRow extends TokenIdentity, TokenFeatures, TokenLabels {
+export interface CSVExportRow extends TokenIdentity, TokenFeatures, AxiomFeatures, AxiomMetadata, TokenLabels {
   collected_at: string;
 }

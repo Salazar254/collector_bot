@@ -460,13 +460,28 @@ def compute_labels(price_data_24h: Optional[dict]) -> dict:
     """
     Compute profit-tier targets from DexScreener 24h price data.
 
-    Targets are cumulative — a 10x token also sets did_2x and did_5x.
+    Targets are cumulative — a 10x token also sets did_1.25x through did_5x.
+
+    Labels:
+      did_1.25x   price_change_24h >= 25%
+      did_1.5x    price_change_24h >= 50%
+      did_2x      price_change_24h >= 100%
+      did_3x      price_change_24h >= 200%
+      did_5x      price_change_24h >= 400%
+      did_10x     price_change_24h >= 900%
+      rugged      price_change_24h <= -80% OR liquidity < $10
+      survived_24h  liquidity >= $10 AND pair still exists after 24h
     """
     if not price_data_24h:
         return {
+            "did_1_25x": 0,
+            "did_1_5x": 0,
             "did_2x": 0,
+            "did_3x": 0,
             "did_5x": 0,
             "did_10x": 0,
+            "rugged": 0,
+            "survived_24h": 0,
             "max_drawdown_pct": 0.0,
             "inferred_label": False,
         }
@@ -474,20 +489,35 @@ def compute_labels(price_data_24h: Optional[dict]) -> dict:
     price_change_24h = float(price_data_24h.get("price_change_24h", 0) or 0)
     liquidity_usd = float(price_data_24h.get("liquidity_usd", 0) or 0)
 
+    # Cumulative labels
+    did_1_25x = 1 if price_change_24h >= 25 else 0
+    did_1_5x = 1 if price_change_24h >= 50 else 0
     did_2x = 1 if price_change_24h >= 100 else 0
+    did_3x = 1 if price_change_24h >= 200 else 0
     did_5x = 1 if price_change_24h >= 400 else 0
     did_10x = 1 if price_change_24h >= 900 else 0
 
+    # Rugged: price dropped > 80% OR liquidity is dead
+    rugged = 1 if (price_change_24h <= -80 or liquidity_usd < 10) else 0
+
+    # Survived 24h: still has meaningful liquidity
+    survived_24h = 1 if liquidity_usd >= 10 else 0
+
     # Dead LP → no profit tier valid
     if liquidity_usd < 10:
-        did_2x = did_5x = did_10x = 0
+        did_1_25x = did_1_5x = did_2x = did_3x = did_5x = did_10x = 0
 
     max_drawdown = max(0.0, -price_change_24h)
 
     return {
+        "did_1_25x": did_1_25x,
+        "did_1_5x": did_1_5x,
         "did_2x": did_2x,
+        "did_3x": did_3x,
         "did_5x": did_5x,
         "did_10x": did_10x,
+        "rugged": rugged,
+        "survived_24h": survived_24h,
         "max_drawdown_pct": max_drawdown,
         "inferred_label": True,
     }

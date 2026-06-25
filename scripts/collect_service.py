@@ -41,6 +41,7 @@ from supabase import create_client, Client
 
 from features import compute_all_features, parse_swaps_for_window
 from quality_validator import QualityValidator, run_quality_check
+from axiom_service import AxiomService, get_axiom_service
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -58,6 +59,8 @@ log = logging.getLogger(__name__)
 HELIUS_KEY = os.environ["HELIUS_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
+AXIOM_API_KEY = os.environ.get("AXIOM_API_KEY", "")
+AXIOM_ENABLED = os.environ.get("AXIOM_ENABLED", "true").lower() == "true" and bool(AXIOM_API_KEY)
 INTERVAL = int(os.environ.get("COLLECTION_INTERVAL_SECONDS", "10"))
 QUALITY_CHECK_INTERVAL = int(os.environ.get("QUALITY_CHECK_INTERVAL", "100"))
 KEEPALIVE_PORT = int(os.environ.get("PORT", "8080"))
@@ -543,6 +546,22 @@ def build_record(
         price_data_24h=price_24h,
     )
 
+    # ---- Axiom: wallet-intelligence features (optional) ----
+    axiom_features: dict = {}
+    if AXIOM_ENABLED:
+        try:
+            axiom_svc = get_axiom_service()
+            axiom_features = axiom_svc.collect_for_token(mint, t0_ts, swaps_by_window)
+            if axiom_features.get("axiom_collected"):
+                log.debug("  Axiom: %d features for %s (cost: $%.6f)",
+                         len(axiom_features) - 2, mint[:10],
+                         axiom_features.get("axiom_cost_usd", 0))
+        except Exception:
+            log.exception("Axiom collection failed for %s", mint[:10])
+            axiom_features = {"axiom_collected": False, "axiom_cost_usd": 0.0}
+    else:
+        axiom_features = {"axiom_collected": False, "axiom_cost_usd": 0.0}
+
     # Build record
     record = {
         "mint": mint,
@@ -551,6 +570,7 @@ def build_record(
         "collected_at": datetime.now(timezone.utc).isoformat(),
         "deployer_address": "",  # populated from DAS if available
         **features,
+        **axiom_features,
     }
 
     # Debug: log swap classification breakdown per window
@@ -691,6 +711,7 @@ def main() -> None:
     log.info("========================================")
     log.info("Helius key   : %s", "SET" if HELIUS_KEY else "MISSING")
     log.info("Supabase URL : %s", "SET" if SUPABASE_URL else "MISSING")
+    log.info("Axiom API    : %s", "ENABLED" if AXIOM_ENABLED else "DISABLED")
     log.info("Poll interval: %ds", INTERVAL)
     log.info("Quality check: every %d tokens", QUALITY_CHECK_INTERVAL)
     log.info("Snapshots    : T0, T0+1m, T0+5m, T0+15m")

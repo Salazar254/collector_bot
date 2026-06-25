@@ -5,3 +5,5 @@ requests>=2.31.0
 numpy>=1.26.0
 python-dotenv>=1.0.0
 # CSV export (stdlib csv module used; no additional deps needed)
+# Axiom API integration — wallet intelligence, smart money, whale behavior
+# Uses requests (already listed above) for HTTP; no additional async deps needed
