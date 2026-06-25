@@ -1,0 +1,22 @@
+# render.yaml — Render Blueprint for collector_bot
+# Auto-deploys on git push to main branch.
+
+services:
+  - type: web
+    name: collector-bot
+    runtime: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.lock
+    startCommand: python scripts/collect_service.py
+    envVars:
+      - key: HELIUS_API_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: COLLECTION_INTERVAL_SECONDS
+        value: "30"
+      - key: PORT
+        value: "8080"
