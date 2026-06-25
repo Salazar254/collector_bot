@@ -21,6 +21,7 @@ import os
 import time
 import json
 import sys
+import argparse
 import logging
 import requests
 import numpy as np
@@ -662,13 +663,19 @@ def process_batch(
     tokens: list[tuple[str, int, str]],
     total_collected: int,
     start_time: float,
+    backfill: bool = False,
 ) -> tuple[int, float]:
     """
     Process a batch of new tokens through the full pipeline:
       1. Helius getAssetBatch  (100 tokens × 2 req/s)
-      2. DexScreener price batch (30 tokens × 5 req/s)
+      2. DexScreener price batch (30 tokens, no rate limit)
       3. Per-token swap fetch     (individual × 2 req/s)
       4. Build records + save to Supabase
+
+    When backfill=True, skip ALL swap fetches — every token is saved
+    with zero_sequence.  This burns ~0.11 credits/token instead of
+    ~100 credits/token, allowing ~250K tokens/day on the Free tier.
+    Swap data can be backfilled in a second pass later.
 
     Returns (new_tokens_saved, tokens_per_second).
     """
@@ -701,14 +708,18 @@ def process_batch(
     priced = len(price_map)
     log.info("  Prices: %d/%d tokens have DexScreener data", priced, len(mints))
 
-    # ── Phase 3: Per-token swaps (skip for low-quality — saves ~75% credits) ──
+    # ── Phase 3: Per-token swaps (backfill skips all — saves 100 credits/token) ──
     records: list[dict] = []
     fetched_swaps = skipped_swaps = 0
     for mint, graduation_ts, tx_sig in tokens:
         asset = asset_map.get(mint, {})
         price_data = price_map.get(mint)
 
-        if should_fetch_swaps(asset, price_data):
+        if backfill:
+            # Skip ALL swap fetches — metadata + labels only
+            swaps = []
+            skipped_swaps += 1
+        elif should_fetch_swaps(asset, price_data):
             swaps = get_token_swaps(mint, graduation_ts)
             fetched_swaps += 1
         else:
@@ -718,7 +729,10 @@ def process_batch(
         record = build_record(mint, graduation_ts, tx_sig, asset, swaps, price_data)
         records.append(record)
 
-    if skipped_swaps:
+    if backfill:
+        log.info("  Swaps: BACKFILL — all %d tokens saved (no swap fetch)",
+                 skipped_swaps)
+    elif skipped_swaps:
         log.info("  Swaps: %d fetched, %d skipped (saves %d credits)",
                  fetched_swaps, skipped_swaps, skipped_swaps * 100)
 
@@ -763,8 +777,28 @@ def start_keepalive_server(port: int) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="collector_bot — pump.fun token data collection"
+    )
+    parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help="Skip swap fetching entirely — collect metadata + labels only "
+             "(~0.11 credits/token vs 100, ~250K tokens/day on Free tier). "
+             "Swap sequences can be backfilled in a second pass.",
+    )
+    args = parser.parse_args()
+
+    # Env var BACKFILL=true overrides CLI arg — toggle from Render dashboard
+    backfill = (
+        os.environ.get("BACKFILL", "").lower() == "true"
+        or args.backfill
+    )
+
+    mode = "BACKFILL (no swaps)" if backfill else "collect (with swaps)"
     log.info("========================================")
     log.info("collector_bot — data collection service")
+    log.info("Mode        : %s", mode)
     log.info("========================================")
     log.info("Helius key  : %s", "SET" if HELIUS_KEY else "MISSING")
     log.info("Supabase URL: %s", "SET" if SUPABASE_URL else "MISSING")
@@ -830,6 +864,7 @@ def main() -> None:
             # Process the batch  (STEPS 2–5)
             new_count, tps = process_batch(
                 new_tokens, total_collected, start_time,
+                backfill=backfill,
             )
             total_collected += new_count
 
@@ -862,7 +897,10 @@ def main() -> None:
             log.exception("Unhandled error in main loop — "
                           "sleeping %ds before retry", INTERVAL)
 
-        time.sleep(INTERVAL)
+        # Backfill: skip sleep when tokens are flowing (max throughput).
+        # Steady-state collection: sleep INTERVAL seconds between cycles.
+        if not backfill:
+            time.sleep(INTERVAL)
 
 
 if __name__ == "__main__":

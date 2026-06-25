@@ -8,7 +8,7 @@ services:
     region: oregon
     plan: free
     buildCommand: pip install -r requirements.lock
-    startCommand: python scripts/collect_service.py
+    startCommand: python scripts/collect_service.py --backfill
     envVars:
       - key: HELIUS_API_KEY
         sync: false
@@ -20,3 +20,5 @@ services:
         value: "30"
       - key: PORT
         value: "8080"
+      - key: BACKFILL
+        value: "true"
