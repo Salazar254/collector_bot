@@ -31,11 +31,11 @@ CREATE TABLE IF NOT EXISTS training_tokens (
   sequence_b64 TEXT,
   has_sequence BOOLEAN DEFAULT FALSE,
 
-  -- Labels
-  rug_label SMALLINT,
-  time_to_rug_hours FLOAT4,
-  max_drawdown_pct FLOAT4,
-  pump_2x_label SMALLINT,
+  -- Labels (profit-tier targets from DexScreener price_change_24h)
+  did_2x SMALLINT DEFAULT 0,      -- price >= 2x  (price_change_24h >= 100%)
+  did_5x SMALLINT DEFAULT 0,      -- price >= 5x  (price_change_24h >= 400%)
+  did_10x SMALLINT DEFAULT 0,     -- price >= 10x (price_change_24h >= 900%)
+  max_drawdown_pct FLOAT4,         -- worst observed drawdown
   inferred_label BOOLEAN DEFAULT FALSE,
 
   -- Metadata
@@ -49,8 +49,10 @@ CREATE TABLE IF NOT EXISTS training_tokens (
 -- Indexes for fast export and dedup queries
 CREATE INDEX IF NOT EXISTS idx_graduation_ts
   ON training_tokens(graduation_timestamp);
-CREATE INDEX IF NOT EXISTS idx_rug_label
-  ON training_tokens(rug_label);
+CREATE INDEX IF NOT EXISTS idx_did_2x
+  ON training_tokens(did_2x);
+CREATE INDEX IF NOT EXISTS idx_did_5x
+  ON training_tokens(did_5x);
 CREATE INDEX IF NOT EXISTS idx_collected_at
   ON training_tokens(collected_at);
 

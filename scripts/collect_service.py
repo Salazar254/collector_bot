@@ -543,26 +543,30 @@ def compute_labels_dexscreener(
     graduation_ts: int,
 ) -> dict:
     """
-    Compute rug-detection labels from DexScreener price data.
-    Uses priceChange.h24 and liquidity to infer rug outcome
-    without needing 72 h of raw swap data.
+    Compute profit-tier targets from DexScreener price_change_24h.
+
+    Targets are NOT mutually exclusive — a 10x token also sets did_2x
+    and did_5x, allowing the model to predict each threshold independently.
     """
     price_change_24h = price_data.get("price_change_24h", 0)
     liquidity_usd = price_data.get("liquidity_usd", 0)
 
-    # Simple rug detection from price change
+    # Profit tiers (cumulative)
+    did_2x = 1 if price_change_24h >= 100 else 0
+    did_5x = 1 if price_change_24h >= 400 else 0
+    did_10x = 1 if price_change_24h >= 900 else 0
+
+    # If LP is gone, no profit tier is valid — treat as dead
+    if liquidity_usd < 10:
+        did_2x = did_5x = did_10x = 0
+
     max_drawdown = max(0.0, -price_change_24h)
 
-    rug_label = 1 if (
-        price_change_24h < -80 or
-        liquidity_usd < 100  # LP essentially gone
-    ) else 0
-
     return {
-        "rug_label": rug_label,
-        "time_to_rug_hours": 12.0 if rug_label else 72.0,
+        "did_2x": did_2x,
+        "did_5x": did_5x,
+        "did_10x": did_10x,
         "max_drawdown_pct": max_drawdown,
-        "pump_2x_label": 1 if price_change_24h > 100 else 0,
         "inferred_label": True,
     }
 
@@ -625,17 +629,13 @@ def build_record(
     if price_data:
         labels = compute_labels_dexscreener(price_data, graduation_ts)
     else:
-        # Fallback: infer labels from authority features
-        high_risk = (
-            features.get("mint_authority_active", 0)
-            + features.get("freeze_authority_active", 0)
-        )
+        # Fallback: no price data → all profit tiers default to 0
         labels = {
-            "rug_label": 1 if high_risk > 0 else 0,
-            "time_to_rug_hours": 24.0 if high_risk > 0 else 72.0,
-            "max_drawdown_pct": 90.0 if high_risk > 0 else 20.0,
-            "pump_2x_label": 0,
-            "inferred_label": True,
+            "did_2x": 0,
+            "did_5x": 0,
+            "did_10x": 0,
+            "max_drawdown_pct": 0.0,
+            "inferred_label": False,
         }
 
     record = {
