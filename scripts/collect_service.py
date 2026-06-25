@@ -518,7 +518,7 @@ def build_record(
         raw_swaps = snap.get("swaps", [])
         window_start = t0_ts
         window_end = t0_ts + SNAPSHOT_WINDOWS[window_label]
-        parsed = parse_swaps_for_window(raw_swaps, window_start, window_end)
+        parsed = parse_swaps_for_window(raw_swaps, window_start, window_end, token_mint=mint)
         feature_key = WINDOW_KEY_MAP[window_label]
         swaps_by_window[feature_key] = parsed
 
@@ -552,6 +552,18 @@ def build_record(
         "deployer_address": "",  # populated from DAS if available
         **features,
     }
+
+    # Debug: log swap classification breakdown per window
+    total_buys = sum(
+        features.get(f"buy_count_{w}", 0) for w in ("1m", "5m", "15m")
+    )
+    total_sells = sum(
+        features.get(f"sell_count_{w}", 0) for w in ("1m", "5m", "15m")
+    )
+    log.info("  Record %s: buys=%d sells=%d vol=$%.0f liq=$%.0f",
+             mint[:10], total_buys, total_sells,
+             features.get("volume_15m", 0),
+             features.get("liquidity_usd_15m", 0))
 
     return record
 

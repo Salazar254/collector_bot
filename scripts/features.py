@@ -38,45 +38,104 @@ def _safe_int(value) -> int:
         return 0
 
 
-def parse_swap(swap: dict) -> dict:
+def parse_swap(tx: dict, token_mint: str = "") -> dict:
     """
-    Parse a single Helius enhanced swap transaction into a normalized dict.
+    Parse a Helius enhanced swap transaction into a normalized dict.
+
+    Uses multi-strategy direction detection:
+      1. nativeInput.amount > 0 → buy
+      2. nativeOutput.amount > 0 → sell
+      3. tokenTransfers: fee-payer receives token_mint → buy, sends → sell
+      4. Fallback: assume buy (most post-graduation swaps are buys)
 
     Returns dict with:
         timestamp, fee_payer, is_buy, sol_amount, usd_estimate
     """
-    ev = swap.get("events", {}).get("swap", {}) or {}
+    ev = tx.get("events", {}).get("swap", {}) or {}
     native_in = ev.get("nativeInput") or {}
     native_out = ev.get("nativeOutput") or {}
 
     in_amt = _safe_int(native_in.get("amount", 0))
     out_amt = _safe_int(native_out.get("amount", 0))
-    sol_amount = (in_amt if in_amt > 0 else out_amt) / 1e9
-    is_buy = in_amt > 0
+    sol_amount = max(in_amt, out_amt) / 1e9 if (in_amt or out_amt) else 0.0
 
-    # SOL price is roughly available from nativeInput/nativeOutput USD fields
-    # Fallback: assume ~$150/SOL if USD info missing
-    usd_info = native_in if is_buy else native_out
-    sol_price_usd = float(usd_info.get("usdPrice", 0) or 0)
+    # Strategy 1 & 2: nativeInput / nativeOutput
+    if in_amt > 0:
+        is_buy = True
+        usd_info = native_in
+    elif out_amt > 0:
+        is_buy = False
+        usd_info = native_out
+    else:
+        # Strategy 3: tokenTransfers fallback
+        fee_payer = tx.get("feePayer", "")
+        is_buy = _detect_direction_from_transfers(tx, token_mint, fee_payer)
+        usd_info = {}
+
+        # Strategy 4: log + assume buy for newly graduated tokens
+        if is_buy is None:
+            log.debug("Swap direction undetermined for %s — assuming buy",
+                      tx.get("signature", "?")[:12])
+            is_buy = True
+
+    # SOL price estimate
+    sol_price_usd = float(usd_info.get("usdPrice", 0) or 0) if usd_info else 0.0
     if sol_price_usd <= 0:
         sol_price_usd = 150.0
 
     return {
-        "timestamp": swap.get("timestamp", 0),
-        "fee_payer": swap.get("feePayer", ""),
+        "timestamp": tx.get("timestamp", 0),
+        "fee_payer": tx.get("feePayer", ""),
         "is_buy": is_buy,
         "sol_amount": sol_amount,
         "usd_estimate": round(sol_amount * sol_price_usd, 2),
     }
 
 
-def parse_swaps_for_window(swaps: list[dict], window_start: int, window_end: int) -> list[dict]:
+def _detect_direction_from_transfers(tx: dict, token_mint: str, fee_payer: str) -> Optional[bool]:
+    """
+    Determine swap direction from tokenTransfers array.
+
+    If fee_payer RECEIVED token_mint → buy (True)
+    If fee_payer SENT token_mint     → sell (False)
+    Returns None if direction cannot be determined.
+    """
+    if not token_mint or not fee_payer:
+        return None
+
+    for transfer in tx.get("tokenTransfers", []):
+        if transfer.get("mint", "") != token_mint:
+            continue
+        from_user = transfer.get("fromUserAccount", "")
+        to_user = transfer.get("toUserAccount", "")
+        token_amount = float(transfer.get("tokenAmount", 0) or 0)
+        if token_amount <= 0:
+            continue
+        if to_user == fee_payer:
+            return True   # fee payer received tokens → buy
+        if from_user == fee_payer:
+            return False  # fee payer sent tokens → sell
+
+    # Also check nativeTransfers as fallback
+    for nt in tx.get("nativeTransfers", []):
+        amt = _safe_int(nt.get("amount", 0))
+        if amt <= 0:
+            continue
+        if nt.get("fromUserAccount", "") == fee_payer:
+            return True   # fee payer sent SOL → buy
+        if nt.get("toUserAccount", "") == fee_payer:
+            return False  # fee payer received SOL → sell
+
+    return None
+
+
+def parse_swaps_for_window(swaps: list[dict], window_start: int, window_end: int, token_mint: str = "") -> list[dict]:
     """Filter and parse swaps within a time window."""
     parsed = []
     for swap in swaps:
         ts = swap.get("timestamp", 0)
         if window_start <= ts <= window_end:
-            parsed.append(parse_swap(swap))
+            parsed.append(parse_swap(swap, token_mint))
     return parsed
 
 
