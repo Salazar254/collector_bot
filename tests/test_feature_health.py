@@ -89,11 +89,11 @@ class TestFeatureHealthReporter(unittest.TestCase):
 
     def test_flags_high_missing_rate(self):
         records = [
-            {"feature_x": 0.0} for _ in range(15)
+            {"feature_x": 0.0} for _ in range(17)
         ] + [
-            {"feature_x": 1.0} for _ in range(5)
+            {"feature_x": 1.0} for _ in range(3)
         ]
-        # 15/20 = 75% missing
+        # 17/20 = 85% missing (> 80% threshold)
         self.reporter.add_records(records)
         report_json = self.reporter.generate_report(["feature_x"])
         report = json.loads(report_json)

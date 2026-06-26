@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-WHALE_THRESHOLDS = [1000.0, 5000.0, 10000.0]
+WHALE_THRESHOLDS = [5000.0, 10000.0]
 WINDOWS_SEC = {"1m": 60, "5m": 300, "15m": 900}
 
 # Default smart money / risk / new-wallet labels (Mobula walletLabelTypes)
@@ -350,109 +350,7 @@ def compute_pnl_features(
 
 
 # ===================================================================
-# ROI FEATURES (6 features)
-# ===================================================================
-
-
-def compute_roi_features(
-    token_wallets: list[dict],
-    swaps_by_window: dict[str, list[dict]],
-) -> dict[str, Any]:
-    """
-    Compute 6 ROI features for buyers across 30d and 1y windows.
-    Uses Mobula's realizedProfitPercentage fields.
-    """
-    wallet_index = _build_wallet_index(token_wallets)
-    buyer_addrs = _get_buyer_addresses(swaps_by_window)
-
-    rois_30d = [
-        _safe_float(wallet_index.get(a, {}).get("realizedProfitPercentage30d", 0))
-        for a in buyer_addrs
-    ]
-    rois_1y = [
-        _safe_float(wallet_index.get(a, {}).get("realizedProfitPercentage1y", 0))
-        for a in buyer_addrs
-    ]
-
-    return {
-        "avg_buyer_roi_30d": round(_safe_mean(rois_30d), 4),
-        "median_buyer_roi_30d": round(_safe_median(rois_30d), 4),
-        "top_buyer_roi_30d": round(max(rois_30d) if rois_30d else 0.0, 4),
-        "avg_buyer_roi_90d": round(_safe_mean(rois_1y), 4),
-        "median_buyer_roi_90d": round(_safe_median(rois_1y), 4),
-        "top_buyer_roi_90d": round(max(rois_1y) if rois_1y else 0.0, 4),
-    }
-
-
-# ===================================================================
-# PROFITABLE TRADER METRICS (8 features)
-# ===================================================================
-
-
-def compute_profitable_trader_features(
-    token_wallets: list[dict],
-    swaps_by_window: dict[str, list[dict]],
-) -> dict[str, Any]:
-    """
-    Compute 8 profitable trader metrics from Mobula per-wallet PnL/ROI.
-    """
-    wallet_index = _build_wallet_index(token_wallets)
-    buyer_addrs = _get_buyer_addresses(swaps_by_window)
-    swaps_15m = swaps_by_window.get("15m", [])
-
-    profitable_count = 0
-    profitable_vol = 0.0
-    high_roi_count = 0
-    elite_count = 0
-    positive_pnl = 0
-    above_20 = 0
-    above_50 = 0
-    above_100 = 0
-
-    for addr in buyer_addrs:
-        w = wallet_index.get(addr, {})
-        pnl = _safe_float(w.get("realizedProfitUsd30d", 0))
-        roi = _safe_float(w.get("realizedProfitPercentage30d", 0))
-        # Elite: high PnL + labels suggest quality
-        is_elite = _has_label(w, DEFAULT_SMART_LABELS) and pnl > 1000
-
-        if pnl > 0:
-            profitable_count += 1
-            positive_pnl += 1
-            # Sum this wallet's buy volume in 15m window
-            wallet_buy_vol = sum(
-                s.get("usd_estimate", 0)
-                for s in swaps_15m
-                if s.get("fee_payer", "") == addr and s.get("is_buy", True)
-            )
-            profitable_vol += wallet_buy_vol
-
-        if roi >= 1.0:
-            high_roi_count += 1
-        if roi >= 1.0:
-            above_100 += 1
-        if roi >= 0.50:
-            above_50 += 1
-        if roi >= 0.20:
-            above_20 += 1
-
-        if is_elite:
-            elite_count += 1
-
-    return {
-        "profitable_wallet_count": profitable_count,
-        "profitable_wallet_buy_volume": round(profitable_vol, 2),
-        "high_roi_wallet_count": high_roi_count,
-        "elite_trader_count": elite_count,
-        "wallets_with_positive_pnl": positive_pnl,
-        "wallets_above_20pct_roi": above_20,
-        "wallets_above_50pct_roi": above_50,
-        "wallets_above_100pct_roi": above_100,
-    }
-
-
-# ===================================================================
-# WHALE AXIOM FEATURES (24 features — 8 per threshold x 3)
+# WHALE AXIOM FEATURES (16 features — 8 per threshold x 2)
 # ===================================================================
 
 
@@ -471,7 +369,7 @@ def compute_whale_axiom_features(
         s.get("usd_estimate", 0) for s in all_swaps_15m if s.get("is_buy", True)
     )
 
-    threshold_labels = {1000.0: "1k", 5000.0: "5k", 10000.0: "10k"}
+    threshold_labels = {5000.0: "5k", 10000.0: "10k"}
 
     for threshold in WHALE_THRESHOLDS:
         label = threshold_labels[threshold]
@@ -906,11 +804,9 @@ def compute_composite_scores(
     # Wallet quality score
     avg_win = _safe_float(existing_features.get("avg_wallet_win_rate", 0))
     avg_roi = _safe_float(existing_features.get("avg_wallet_roi", 0))
-    elite = _safe_int(existing_features.get("elite_trader_count", 0))
     wallet_quality_score = np.clip(
-        avg_win * 0.4
-        + avg_roi * 0.3
-        + (elite / max(total_buyers, 1)) * 0.3,
+        avg_win * 0.5
+        + avg_roi * 0.5,
         0, 1,
     )
 
@@ -1003,12 +899,6 @@ def compute_axiom_features(
     )
     all_features.update(
         compute_pnl_features(token_wallets, swaps_by_window)
-    )
-    all_features.update(
-        compute_roi_features(token_wallets, swaps_by_window)
-    )
-    all_features.update(
-        compute_profitable_trader_features(token_wallets, swaps_by_window)
     )
     all_features.update(
         compute_whale_axiom_features(token_wallets, swaps_by_window)

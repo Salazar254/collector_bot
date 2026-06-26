@@ -58,41 +58,7 @@ ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS avg_seller_pnl_90d         
 ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS median_seller_pnl_90d            FLOAT4;
 
 -- =======================================================================
--- 5. ROI (6 columns, source: Axiom)
--- =======================================================================
-ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS avg_buyer_roi_30d                FLOAT4;
-ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS median_buyer_roi_30d             FLOAT4;
-ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS top_buyer_roi_30d                FLOAT4;
-ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS avg_buyer_roi_90d                FLOAT4;
-ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS median_buyer_roi_90d             FLOAT4;
-ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS top_buyer_roi_90d                FLOAT4;
-
--- =======================================================================
--- 6. PROFITABLE TRADER METRICS (8 columns, source: Axiom)
--- =======================================================================
-ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS profitable_wallet_count          INT4;
-ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS profitable_wallet_buy_volume     FLOAT4;
-ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS high_roi_wallet_count            INT4;
-ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS elite_trader_count               INT4;
-ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS wallets_with_positive_pnl        INT4;
-ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS wallets_above_20pct_roi          INT4;
-ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS wallets_above_50pct_roi          INT4;
-ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS wallets_above_100pct_roi         INT4;
-
--- =======================================================================
--- 7. WHALE AXIOM — $1,000 threshold (8 columns, source: Axiom)
--- =======================================================================
-ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS largest_buy_usd_1k               FLOAT4;
-ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS largest_sell_usd_1k              FLOAT4;
-ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS whale_buy_count_1k               INT4;
-ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS whale_sell_count_1k              INT4;
-ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS whale_buy_volume_1k              FLOAT4;
-ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS whale_sell_volume_1k             FLOAT4;
-ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS whale_net_flow_1k                FLOAT4;
-ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS whale_accumulation_rate_1k       FLOAT4;
-
--- =======================================================================
--- 8. WHALE AXIOM — $5,000 threshold (8 columns, source: Axiom)
+-- 5. WHALE AXIOM — $5,000 threshold (8 columns, source: Axiom)
 -- =======================================================================
 ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS largest_buy_usd_5k               FLOAT4;
 ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS largest_sell_usd_5k              FLOAT4;

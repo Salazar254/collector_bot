@@ -72,15 +72,6 @@ CREATE TABLE IF NOT EXISTS training_tokens (
   net_flow_usd           FLOAT4,   -- (total_buy_vol - total_sell_vol) over 15m
 
   -- =======================================================================
-  -- HOLDERS (5 features, source: Helius DAS + swap inference)
-  -- =======================================================================
-  holder_count_1m        INT4,     -- distinct token-account holders at snapshot
-  holder_count_5m        INT4,
-  holder_count_15m       INT4,
-  holder_growth_5m       FLOAT4,   -- (holders_5m - holders_1m) / max(holders_1m, 1)
-  holder_growth_15m      FLOAT4,   -- (holders_15m - holders_1m) / max(holders_1m, 1)
-
-  -- =======================================================================
   -- WHALES (5 features, source: Helius swap transactions, >= 10 SOL)
   -- =======================================================================
   largest_buy_usd        FLOAT4,   -- largest single buy in first 15m
@@ -140,40 +131,6 @@ CREATE TABLE IF NOT EXISTS training_tokens (
   median_seller_pnl_30d             FLOAT4,
   avg_seller_pnl_90d                FLOAT4,
   median_seller_pnl_90d             FLOAT4,
-
-  -- =======================================================================
-  -- ROI (6 features, source: Axiom)
-  -- =======================================================================
-  avg_buyer_roi_30d                 FLOAT4,
-  median_buyer_roi_30d              FLOAT4,
-  top_buyer_roi_30d                 FLOAT4,
-  avg_buyer_roi_90d                 FLOAT4,
-  median_buyer_roi_90d              FLOAT4,
-  top_buyer_roi_90d                 FLOAT4,
-
-  -- =======================================================================
-  -- PROFITABLE TRADER METRICS (8 features, source: Axiom)
-  -- =======================================================================
-  profitable_wallet_count           INT4,
-  profitable_wallet_buy_volume      FLOAT4,
-  high_roi_wallet_count             INT4,
-  elite_trader_count                INT4,
-  wallets_with_positive_pnl         INT4,
-  wallets_above_20pct_roi           INT4,
-  wallets_above_50pct_roi           INT4,
-  wallets_above_100pct_roi          INT4,
-
-  -- =======================================================================
-  -- WHALE AXIOM — $1,000 threshold (8 features, source: Axiom)
-  -- =======================================================================
-  largest_buy_usd_1k                FLOAT4,
-  largest_sell_usd_1k               FLOAT4,
-  whale_buy_count_1k                INT4,
-  whale_sell_count_1k               INT4,
-  whale_buy_volume_1k               FLOAT4,
-  whale_sell_volume_1k              FLOAT4,
-  whale_net_flow_1k                 FLOAT4,
-  whale_accumulation_rate_1k        FLOAT4,
 
   -- =======================================================================
   -- WHALE AXIOM — $5,000 threshold (8 features, source: Axiom)

@@ -108,19 +108,6 @@ export interface OrderFlowFeatures {
 }
 
 // =========================================================================
-// HOLDERS — 5 features, source: Helius DAS + swap inference
-// =========================================================================
-
-export interface HolderFeatures {
-  holder_count_1m: number;       // int32 — distinct token-account holders at snapshot
-  holder_count_5m: number;       // int32
-  holder_count_15m: number;      // int32
-
-  holder_growth_5m: number;      // (holders_5m - holders_1m) / max(holders_1m, 1)
-  holder_growth_15m: number;     // (holders_15m - holders_1m) / max(holders_1m, 1)
-}
-
-// =========================================================================
 // WHALES — 5 features, source: Helius swap transactions (≥10 SOL threshold)
 // =========================================================================
 
@@ -154,7 +141,6 @@ export interface TokenFeatures
     BuyerFeatures,
     SellerFeatures,
     OrderFlowFeatures,
-    HolderFeatures,
     WhaleFeatures,
     VolatilityFeatures {}
 

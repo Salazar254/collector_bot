@@ -16,8 +16,6 @@ from axiom_features import (
     compute_smart_money_features,
     compute_wallet_quality_features,
     compute_pnl_features,
-    compute_roi_features,
-    compute_profitable_trader_features,
     compute_whale_axiom_features,
     compute_buyer_quality_features,
     compute_conviction_features,
@@ -337,22 +335,12 @@ class TestPnlFeatures(unittest.TestCase):
 
 
 class TestWhaleAxiomFeatures(unittest.TestCase):
-    def test_computes_24_whale_features(self):
+    def test_computes_16_whale_features(self):
         result = compute_whale_axiom_features(
             _make_token_wallets(), _make_swaps_by_window(),
         )
-        # 3 thresholds x 8 features = 24
-        self.assertEqual(len(result), 24)
-
-    def test_whale_threshold_1k(self):
-        result = compute_whale_axiom_features(
-            _make_token_wallets(), _make_swaps_by_window(),
-        )
-        # wallets 1/4/6/7 have amountBoughtUsd1d >= 1k
-        # whale buys: wallet1, wallet4, wallet6 = 3
-        # whale sells: wallet1 ($200), wallet7 ($5K) = 2
-        self.assertGreater(result["whale_buy_count_1k"], 0)
-        self.assertGreaterEqual(result["whale_sell_count_1k"], 1)
+        # 2 thresholds x 8 features = 16 (5k, 10k only)
+        self.assertEqual(len(result), 16)
 
     def test_whale_threshold_5k(self):
         result = compute_whale_axiom_features(

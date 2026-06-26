@@ -26,6 +26,7 @@ ENVIRONMENT VARIABLES (set in Render dashboard):
 """
 
 import os
+import socket
 import time
 import json
 import sys
@@ -213,20 +214,125 @@ class SnapshotScheduler:
 # API HELPERS
 # ===================================================================
 
+DNS_WARMUP_HOSTS = [
+    "api.helius.xyz",
+    "mainnet.helius-rpc.com",
+]
 
-def with_retry(fn, max_retries=5, base_wait=1.0):
-    """Exponential backoff retry for all API calls."""
+
+def wait_for_dns(
+    hosts: list[str] | None = None,
+    timeout_seconds: int = 180,
+    check_interval: float = 10.0,
+) -> bool:
+    """
+    Block until DNS resolution succeeds for all required hosts, or timeout.
+
+    Render free-tier cold-starts delay DNS resolver initialization by 1-3 minutes.
+    This gate prevents the main loop from burning retry budgets on infrastructure-
+    level name-resolution failures that no amount of exponential backoff can fix.
+
+    Args:
+        hosts: Hostnames to check. Defaults to DNS_WARMUP_HOSTS.
+        timeout_seconds: Maximum time to wait for all hosts to resolve.
+        check_interval: Seconds between resolution attempts.
+
+    Returns True if all hosts resolved, False if timeout elapsed.
+    """
+    if hosts is None:
+        hosts = list(DNS_WARMUP_HOSTS)
+
+    deadline = time.time() + timeout_seconds
+    unresolved = set(hosts)
+
+    while unresolved and time.time() < deadline:
+        still_down = set()
+        for host in unresolved:
+            try:
+                socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+                log.info("DNS resolved: %s", host)
+            except socket.gaierror:
+                still_down.add(host)
+
+        unresolved = still_down
+
+        if not unresolved:
+            log.info("All DNS hosts resolved — entering main loop")
+            return True
+
+        remaining = max(0.0, deadline - time.time())
+        log.info(
+            "DNS pending for %d host(s): %s — retrying in %.0fs (%.0fs remaining)",
+            len(unresolved),
+            ", ".join(sorted(unresolved)),
+            check_interval,
+            remaining,
+        )
+        time.sleep(min(check_interval, remaining))
+
+    if unresolved:
+        log.error(
+            "DNS warmup timed out after %ds — unresolvable: %s",
+            timeout_seconds,
+            ", ".join(sorted(unresolved)),
+        )
+        return False
+    return True
+
+
+def with_retry(fn, max_retries=5, base_wait=1.0, name: str = ""):
+    """Exponential backoff retry for all API calls.
+
+    DNS-resolution failures (socket.gaierror) are logged at INFO level
+    rather than WARNING because they are expected during Render cold-starts
+    and are handled by the pre-flight wait_for_dns() gate.
+
+    Args:
+        fn: Callable that returns a result or None on soft failure.
+        max_retries: Maximum number of attempts.
+        base_wait: Base wait time in seconds for exponential backoff.
+        name: Human-readable label for log messages (e.g. "DexScreener:price").
+    """
+    tag = f"[{name}] " if name else ""
     for attempt in range(max_retries):
         try:
             result = fn()
             if result is not None:
                 return result
+            # Soft failure — fn() returned None (rate-limited, no data, etc.)
+            if attempt < max_retries - 1:
+                log.info("%sAttempt %d returned empty (rate limit / no data)", tag, attempt + 1)
         except Exception as e:
-            log.warning("Attempt %d failed: %s", attempt + 1, e)
-        wait = (base_wait * 2 ** attempt) + (0.1 * attempt)
-        log.info("Waiting %.1fs before retry", wait)
-        time.sleep(wait)
+            # Distinguish DNS failures from application errors
+            if _is_dns_error(e):
+                log.info("%sAttempt %d DNS not ready: %s", tag, attempt + 1, e)
+            else:
+                log.warning("%sAttempt %d failed: %s", tag, attempt + 1, e)
+        if attempt < max_retries - 1:
+            wait = (base_wait * 2 ** attempt) + (0.1 * attempt)
+            log.info("%sWaiting %.1fs before retry", tag, wait)
+            time.sleep(wait)
     return None
+
+
+def _is_dns_error(exc: Exception) -> bool:
+    """Return True if the exception (or its cause chain) is a DNS failure."""
+    cur: BaseException | None = exc
+    while cur is not None:
+        if isinstance(cur, socket.gaierror):
+            return True
+        # requests wraps DNS errors in various exception types — check the message
+        msg = str(cur).lower()
+        if any(phrase in msg for phrase in (
+            "name resolution",
+            "failed to resolve",
+            "temporary failure in name resolution",
+            "nodata",
+            "nxdomain",
+        )):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 # ===================================================================
@@ -329,7 +435,7 @@ def get_graduated_mints(
         r.raise_for_status()
         return r.json()
 
-    result = with_retry(fetch)
+    result = with_retry(fetch, name="Helius:migration")
     time.sleep(0.5)  # 2 req/s limit
     return result or []
 
@@ -362,7 +468,7 @@ def get_asset(mint: str) -> dict:
         r.raise_for_status()
         return r.json().get("result", {})
 
-    result = with_retry(fetch, max_retries=3, base_wait=0.5)
+    result = with_retry(fetch, max_retries=3, base_wait=0.5, name="Helius:getAsset")
     time.sleep(0.3)
     return result or {}
 
@@ -404,7 +510,7 @@ def get_token_swaps_window(
             if from_ts <= tx.get("timestamp", 0) <= to_ts
         ]
 
-    result = with_retry(fetch, max_retries=3, base_wait=0.5)
+    result = with_retry(fetch, max_retries=3, base_wait=0.5, name="Helius:swaps")
     time.sleep(0.5)  # 2 req/s limit
     return result or []
 
@@ -429,7 +535,7 @@ def get_price_snapshot(mint: str) -> dict:
         r.raise_for_status()
         return r.json()
 
-    result = with_retry(fetch, max_retries=2, base_wait=0.5)
+    result = with_retry(fetch, max_retries=2, base_wait=0.5, name="DexScreener:price")
 
     if not result:
         return {}
@@ -464,7 +570,7 @@ def get_price_data_24h(mint: str) -> Optional[dict]:
         r.raise_for_status()
         return r.json()
 
-    result = with_retry(fetch, max_retries=2, base_wait=0.5)
+    result = with_retry(fetch, max_retries=2, base_wait=0.5, name="DexScreener:24h")
 
     if not result:
         return None
@@ -525,16 +631,6 @@ def build_record(
         feature_key = WINDOW_KEY_MAP[window_label]
         swaps_by_window[feature_key] = parsed
 
-    # Holder snapshots from DAS metadata
-    holder_snapshots: dict[str, int] = {}
-    for window_label in ("t1m", "t5m", "t15m"):
-        snap = snapshots_raw.get(window_label, {})
-        asset = snap.get("asset", {})
-        feature_key = WINDOW_KEY_MAP[window_label]
-        holder_snapshots[feature_key] = (
-            asset.get("holder_count", 0) if asset else 0
-        )
-
     # 24h data for labels (fetched after 15m when we have mature data)
     price_24h = get_price_data_24h(mint)
 
@@ -542,7 +638,6 @@ def build_record(
     features = compute_all_features(
         snapshots=snapshots,
         swaps_by_window=swaps_by_window,
-        holder_snapshots=holder_snapshots,
         price_data_24h=price_24h,
     )
 
@@ -604,7 +699,6 @@ def collect_snapshot_for_token(
     For each window, fetches:
       - DexScreener price/liquidity
       - Helius swap transactions within [T0, T0+window_seconds]
-      - Helius DAS asset metadata (for holder count)
 
     Returns a dict to store in the scheduler.
     """
@@ -618,19 +712,9 @@ def collect_snapshot_for_token(
     # Fetch swaps from Helius
     swaps = get_token_swaps_window(mint, from_ts, to_ts)
 
-    # Fetch asset metadata for holder count
-    asset = get_asset(mint)
-    holders = 0
-    if asset:
-        supply_info = asset.get("supply", {}) or {}
-        holders = int(supply_info.get("holderCount", 0) or 0)
-
     return {
         "price": price,
         "swaps": swaps,
-        "asset": {
-            "holder_count": holders,
-        },
         "collected_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -738,6 +822,22 @@ def main() -> None:
     )
     keepalive_thread.start()
     time.sleep(0.5)
+
+    # ---- DNS warmup (Render free-tier cold-start mitigations) ----
+    _hosts = list(DNS_WARMUP_HOSTS)
+    if SUPABASE_URL:
+        try:
+            from urllib.parse import urlparse
+            _supa_host = urlparse(SUPABASE_URL).hostname
+            if _supa_host:
+                _hosts.append(_supa_host)
+        except Exception:
+            pass
+    if AXIOM_ENABLED:
+        _hosts.append("graphql.mobula.io")
+
+    log.info("DNS warmup: checking %d host(s) before starting collection", len(_hosts))
+    wait_for_dns(hosts=_hosts, timeout_seconds=180, check_interval=5.0)
 
     # ---- Load existing mints ----
     existing = get_existing_mints()

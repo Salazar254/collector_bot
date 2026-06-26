@@ -46,9 +46,6 @@ NUMERIC_FEATURES: list[str] = [
     "sell_count_1m", "sell_count_5m", "sell_count_15m",
     "buy_sell_ratio_1m", "buy_sell_ratio_5m", "buy_sell_ratio_15m",
     "net_flow_usd",
-    # HOLDERS (5)
-    "holder_count_1m", "holder_count_5m", "holder_count_15m",
-    "holder_growth_5m", "holder_growth_15m",
     # WHALES (5)
     "largest_buy_usd", "largest_sell_usd",
     "whale_buy_count", "whale_sell_count",
@@ -74,19 +71,6 @@ NUMERIC_FEATURES: list[str] = [
     "avg_buyer_pnl_90d", "median_buyer_pnl_90d", "top_buyer_pnl_90d",
     "avg_seller_pnl_30d", "median_seller_pnl_30d",
     "avg_seller_pnl_90d", "median_seller_pnl_90d",
-    # ROI (6)
-    "avg_buyer_roi_30d", "median_buyer_roi_30d", "top_buyer_roi_30d",
-    "avg_buyer_roi_90d", "median_buyer_roi_90d", "top_buyer_roi_90d",
-    # PROFITABLE_TRADER (8)
-    "profitable_wallet_count", "profitable_wallet_buy_volume",
-    "high_roi_wallet_count", "elite_trader_count",
-    "wallets_with_positive_pnl",
-    "wallets_above_20pct_roi", "wallets_above_50pct_roi", "wallets_above_100pct_roi",
-    # WHALE_AXIOM — 1K (8)
-    "largest_buy_usd_1k", "largest_sell_usd_1k",
-    "whale_buy_count_1k", "whale_sell_count_1k",
-    "whale_buy_volume_1k", "whale_sell_volume_1k",
-    "whale_net_flow_1k", "whale_accumulation_rate_1k",
     # WHALE_AXIOM — 5K (8)
     "largest_buy_usd_5k", "largest_sell_usd_5k",
     "whale_buy_count_5k", "whale_sell_count_5k",

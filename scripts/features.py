@@ -351,31 +351,6 @@ def compute_order_flow_features(swaps_by_window: dict) -> dict:
 
 
 # ===================================================================
-# HOLDER FEATURES (5)
-# ===================================================================
-
-
-def compute_holder_features(holder_snapshots: dict) -> dict:
-    """
-    Compute holder counts and growth from holder snapshots.
-
-    holder_snapshots: {"1m": count, "5m": count, "15m": count}
-    """
-    h1 = holder_snapshots.get("1m", 0)
-    h5 = holder_snapshots.get("5m", 0)
-    h15 = holder_snapshots.get("15m", 0)
-
-    features = {
-        "holder_count_1m": h1,
-        "holder_count_5m": h5,
-        "holder_count_15m": h15,
-        "holder_growth_5m": round(((h5 - h1) / max(h1, 1)), 4),
-        "holder_growth_15m": round(((h15 - h1) / max(h1, 1)), 4),
-    }
-    return features
-
-
-# ===================================================================
 # WHALE FEATURES (5)
 # ===================================================================
 
@@ -531,7 +506,6 @@ def compute_labels(price_data_24h: Optional[dict]) -> dict:
 def compute_all_features(
     snapshots: dict,
     swaps_by_window: dict,
-    holder_snapshots: Optional[dict] = None,
     price_data_24h: Optional[dict] = None,
 ) -> dict:
     """
@@ -540,7 +514,6 @@ def compute_all_features(
     Args:
         snapshots: {"t0": {"price_usd", "liquidity_usd"}, "t1m": {...}, ...}
         swaps_by_window: {"1m": [parsed_swaps], "5m": [...], "15m": [...]}
-        holder_snapshots: {"1m": count, "5m": count, "15m": count}
         price_data_24h: DexScreener 24h data for label computation
 
     Returns:
@@ -557,15 +530,6 @@ def compute_all_features(
     seller_feats = compute_seller_features(swaps_by_window)
     order_feats = compute_order_flow_features(swaps_by_window)
     whale_feats = compute_whale_features(swaps_by_window)
-
-    # Holder features
-    if holder_snapshots:
-        holder_feats = compute_holder_features(holder_snapshots)
-    else:
-        holder_feats = {
-            "holder_count_1m": 0, "holder_count_5m": 0, "holder_count_15m": 0,
-            "holder_growth_5m": 0.0, "holder_growth_15m": 0.0,
-        }
 
     # Volatility from price series
     price_series = [
@@ -587,7 +551,6 @@ def compute_all_features(
     all_features.update(buyer_feats)
     all_features.update(seller_feats)
     all_features.update(order_feats)
-    all_features.update(holder_feats)
     all_features.update(whale_feats)
     all_features.update(vol_feats_volatility)
     all_features.update(labels)

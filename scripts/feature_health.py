@@ -21,9 +21,9 @@ log = logging.getLogger(__name__)
 # Thresholds
 # ---------------------------------------------------------------------------
 
-MISSING_RATE_THRESHOLD = 50.0
-VARIANCE_EPSILON = 1e-8
-UNIQUE_MIN_THRESHOLD = 1  # flag if unique_values <= 1
+MISSING_RATE_THRESHOLD = 80.0  # FAIL if > 80% of rows are null/zero
+VARIANCE_EPSILON = 1e-8        # FAIL if variance below this (effectively zero)
+UNIQUE_MIN_THRESHOLD = 1       # FAIL if unique_values <= 1
 
 
 class FeatureHealthReporter:

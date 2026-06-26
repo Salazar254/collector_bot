@@ -74,51 +74,10 @@ export interface PnlFeatures {
 }
 
 // =========================================================================
-// ROI FEATURES (6 features)
-// =========================================================================
-
-export interface RoiFeatures {
-  avg_buyer_roi_30d: number;             // float32
-  median_buyer_roi_30d: number;          // float32
-  top_buyer_roi_30d: number;             // float32
-
-  avg_buyer_roi_90d: number;             // float32
-  median_buyer_roi_90d: number;          // float32
-  top_buyer_roi_90d: number;             // float32
-}
-
-// =========================================================================
-// PROFITABLE TRADER METRICS (8 features)
-// =========================================================================
-
-export interface ProfitableTraderFeatures {
-  profitable_wallet_count: number;        // int32 — wallets with lifetime PnL > 0
-  profitable_wallet_buy_volume: number;   // float32 — total buy volume from profitable wallets
-
-  high_roi_wallet_count: number;          // int32 — wallets with ROI > 100%
-  elite_trader_count: number;             // int32 — wallets with win_rate > 60% AND > 50 trades
-
-  wallets_with_positive_pnl: number;      // int32
-  wallets_above_20pct_roi: number;        // int32
-  wallets_above_50pct_roi: number;        // int32
-  wallets_above_100pct_roi: number;       // int32
-}
-
-// =========================================================================
-// WHALE METRICS — per threshold: $1K, $5K, $10K (20 features)
+// WHALE METRICS — per threshold: $5K, $10K (16 features)
 // =========================================================================
 
 export interface WhaleAxiomFeatures {
-  // --- $1,000 threshold ---
-  largest_buy_usd_1k: number;             // float32
-  largest_sell_usd_1k: number;            // float32
-  whale_buy_count_1k: number;             // int32
-  whale_sell_count_1k: number;            // int32
-  whale_buy_volume_1k: number;            // float32
-  whale_sell_volume_1k: number;           // float32
-  whale_net_flow_1k: number;              // float32 — buy_vol − sell_vol
-  whale_accumulation_rate_1k: number;     // float32 — whale buy vol / total buy vol
-
   // --- $5,000 threshold ---
   largest_buy_usd_5k: number;             // float32
   largest_sell_usd_5k: number;            // float32
@@ -244,8 +203,6 @@ export interface AxiomFeatures
   extends SmartMoneyFeatures,
     WalletQualityFeatures,
     PnlFeatures,
-    RoiFeatures,
-    ProfitableTraderFeatures,
     WhaleAxiomFeatures,
     BuyerQualityFeatures,
     ConvictionFeatures,
