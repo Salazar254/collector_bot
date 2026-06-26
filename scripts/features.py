@@ -9,6 +9,7 @@ Inputs: snapshot price/liquidity data + swap transaction lists per window.
 Output: flat dict of all features + labels ready for Supabase upsert.
 """
 
+import base64
 import logging
 from typing import Optional
 
@@ -431,6 +432,132 @@ def compute_volatility_features(price_points: list[float]) -> dict:
 # ===================================================================
 
 
+# ===================================================================
+# SAFETY FEATURES (9)
+# ===================================================================
+
+
+def compute_safety_features(
+    snapshots: dict,
+    swaps_by_window: dict,
+    t0_asset: Optional[dict] = None,
+    pair_created_at: int = 0,
+    graduation_timestamp: int = 0,
+) -> dict:
+    """
+    Compute 9 safety/security features from Helius DAS metadata + swap data.
+
+    Features:
+      mint_authority_active    — 1 if mint authority not revoked (DAS)
+      freeze_authority_active  — 1 if freeze authority not revoked (DAS)
+      mutable_metadata         — 1 if token metadata is mutable (DAS/Metaplex)
+      lp_burn_pct              — percentage of LP tokens burned (0-100)
+      initial_liquidity_sol    — SOL in LP pool at T0
+      migration_speed_seconds  — graduation_ts - pair_created_at
+      avg_transaction_size_sol — avg SOL per swap in 15m window
+      sequence_b64             — base64-encoded compressed price/volume series
+      has_sequence             — True if at least 2 price points exist
+    """
+    asset = t0_asset or {}
+
+    # ── mint_authority_active ──
+    # Check DAS ownership for mint authority. Pump.fun tokens typically
+    # have mint authority revoked at graduation, but some don't.
+    mint_authority_active = 0
+    ownership = asset.get("ownership", {}) or {}
+    # ownership.delegate can indicate active mint authority
+    if ownership.get("delegate"):
+        mint_authority_active = 1
+    # Also check token_info / metadata for mint_authority field
+    token_info = asset.get("token_info", {}) or {}
+    if token_info.get("mint_authority"):
+        mint_authority_active = 1
+
+    # ── freeze_authority_active ──
+    freeze_authority_active = 0
+    if token_info.get("freeze_authority"):
+        freeze_authority_active = 1
+    # fallback: check ownership.frozen
+    if asset.get("ownership", {}).get("frozen", False):
+        freeze_authority_active = 1
+
+    # ── mutable_metadata ──
+    mutable_metadata = 0
+    content = asset.get("content", {}) or {}
+    metadata = content.get("metadata", {}) or {}
+    if metadata.get("mutable", False) or metadata.get("isMutable", False):
+        mutable_metadata = 1
+    # Some DAS responses nest this deeper
+    content_metadata = content.get("metadata") or {}
+    if isinstance(content_metadata, dict):
+        if content_metadata.get("mutable") or content_metadata.get("isMutable"):
+            mutable_metadata = 1
+
+    # ── lp_burn_pct ──
+    # pump.fun graduations: LP is burned during migration (Raydium pool creation).
+    # When pair_created_at > 0 (pair exists) → assume LP burned = 100% for pump.fun
+    # Otherwise, unknown → 0
+    lp_burn_pct = 100.0 if pair_created_at > 0 else 0.0
+
+    # ── initial_liquidity_sol ──
+    l0 = float(snapshots.get("t0", {}).get("liquidity_usd", 0) or 0)
+    sol_price = 150.0  # approximate SOL/USD
+    initial_liquidity_sol = round(l0 / sol_price, 4) if l0 > 0 else 0.0
+
+    # ── migration_speed_seconds ──
+    # pair_created_at from DexScreener is in milliseconds
+    pair_created_at_s = int(pair_created_at) // 1000 if pair_created_at > 1000000000000 else int(pair_created_at)
+    if graduation_timestamp > 0 and pair_created_at_s > 0:
+        migration_speed_seconds = max(0, graduation_timestamp - pair_created_at_s)
+    else:
+        migration_speed_seconds = 0
+
+    # ── avg_transaction_size_sol ──
+    all_swaps = swaps_by_window.get("15m", [])
+    if all_swaps:
+        avg_transaction_size_sol = round(
+            sum(s["sol_amount"] for s in all_swaps) / len(all_swaps), 6
+        )
+    else:
+        avg_transaction_size_sol = 0.0
+
+    # ── sequence_b64 + has_sequence ──
+    # Compress price+volume time series into base64-encoded float32 array
+    p0 = float(snapshots.get("t0", {}).get("price_usd", 0) or 0)
+    p1 = float(snapshots.get("t1m", {}).get("price_usd", 0) or 0)
+    p5 = float(snapshots.get("t5m", {}).get("price_usd", 0) or 0)
+    p15 = float(snapshots.get("t15m", {}).get("price_usd", 0) or 0)
+    v1 = sum(s["usd_estimate"] for s in swaps_by_window.get("1m", []))
+    v5 = sum(s["usd_estimate"] for s in swaps_by_window.get("5m", []))
+    v15 = sum(s["usd_estimate"] for s in swaps_by_window.get("15m", []))
+
+    prices = [p for p in (p0, p1, p5, p15) if p > 0]
+    has_sequence = len(prices) >= 2
+
+    seq_array = np.array(
+        [p0, p1, p5, p15, l0, v1, v5, v15],
+        dtype=np.float32,
+    )
+    sequence_b64 = base64.b64encode(seq_array.tobytes()).decode("ascii")
+
+    return {
+        "mint_authority_active": mint_authority_active,
+        "freeze_authority_active": freeze_authority_active,
+        "mutable_metadata": mutable_metadata,
+        "lp_burn_pct": lp_burn_pct,
+        "initial_liquidity_sol": initial_liquidity_sol,
+        "migration_speed_seconds": migration_speed_seconds,
+        "avg_transaction_size_sol": avg_transaction_size_sol,
+        "sequence_b64": sequence_b64,
+        "has_sequence": has_sequence,
+    }
+
+
+# ===================================================================
+# LABEL COMPUTATION (from DexScreener 24h data)
+# ===================================================================
+
+
 def compute_labels(price_data_24h: Optional[dict]) -> dict:
     """
     Compute profit-tier targets from DexScreener 24h price data.
@@ -446,6 +573,10 @@ def compute_labels(price_data_24h: Optional[dict]) -> dict:
       did_10x     price_change_24h >= 900%
       rugged      price_change_24h <= -80% OR liquidity < $10
       survived_24h  liquidity >= $10 AND pair still exists after 24h
+
+    Also computes best-effort peak metrics from single-point 24h data:
+      peak_multiplier       = 1 + max(0, price_change_24h) / 100
+      time_to_peak_minutes  = None (unknowable without intraday tick data)
     """
     if not price_data_24h:
         return {
@@ -459,6 +590,8 @@ def compute_labels(price_data_24h: Optional[dict]) -> dict:
             "survived_24h": 0,
             "max_drawdown_pct": 0.0,
             "inferred_label": False,
+            "time_to_peak_minutes": None,
+            "peak_multiplier": 1.0,
         }
 
     price_change_24h = float(price_data_24h.get("price_change_24h", 0) or 0)
@@ -484,6 +617,13 @@ def compute_labels(price_data_24h: Optional[dict]) -> dict:
 
     max_drawdown = max(0.0, -price_change_24h)
 
+    # Peak metrics (best-effort from single datapoint)
+    if price_change_24h > 0:
+        peak_multiplier = round(1.0 + (price_change_24h / 100.0), 4)
+    else:
+        peak_multiplier = 1.0
+    time_to_peak = None  # cannot determine from single-point API
+
     return {
         "did_1_25x": did_1_25x,
         "did_1_5x": did_1_5x,
@@ -495,6 +635,8 @@ def compute_labels(price_data_24h: Optional[dict]) -> dict:
         "survived_24h": survived_24h,
         "max_drawdown_pct": max_drawdown,
         "inferred_label": True,
+        "time_to_peak_minutes": time_to_peak,
+        "peak_multiplier": peak_multiplier,
     }
 
 
@@ -507,14 +649,20 @@ def compute_all_features(
     snapshots: dict,
     swaps_by_window: dict,
     price_data_24h: Optional[dict] = None,
+    t0_asset: Optional[dict] = None,
+    pair_created_at: int = 0,
+    graduation_timestamp: int = 0,
 ) -> dict:
     """
-    Compute ALL 50 features + labels from raw data.
+    Compute ALL features + labels from raw data.
 
     Args:
         snapshots: {"t0": {"price_usd", "liquidity_usd"}, "t1m": {...}, ...}
         swaps_by_window: {"1m": [parsed_swaps], "5m": [...], "15m": [...]}
         price_data_24h: DexScreener 24h data for label computation
+        t0_asset: Helius DAS getAsset response for safety features
+        pair_created_at: DexScreener pair_created_at timestamp (ms)
+        graduation_timestamp: pump.fun graduation unix timestamp
 
     Returns:
         Flat dict of all features + labels, ready for Supabase upsert.
@@ -540,6 +688,15 @@ def compute_all_features(
     ]
     vol_feats_volatility = compute_volatility_features(price_series)
 
+    # Safety features
+    safety_feats = compute_safety_features(
+        snapshots=snapshots,
+        swaps_by_window=swaps_by_window,
+        t0_asset=t0_asset,
+        pair_created_at=pair_created_at,
+        graduation_timestamp=graduation_timestamp,
+    )
+
     # Labels
     labels = compute_labels(price_data_24h)
 
@@ -553,6 +710,7 @@ def compute_all_features(
     all_features.update(order_feats)
     all_features.update(whale_feats)
     all_features.update(vol_feats_volatility)
+    all_features.update(safety_feats)
     all_features.update(labels)
 
     return all_features

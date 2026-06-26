@@ -96,6 +96,17 @@ CSV_COLUMNS: list[str] = [
     "volatility_15m",
     "drawdown_first_15m",
 
+    # SAFETY (9)
+    "mint_authority_active",
+    "freeze_authority_active",
+    "mutable_metadata",
+    "lp_burn_pct",
+    "initial_liquidity_sol",
+    "migration_speed_seconds",
+    "avg_transaction_size_sol",
+    "sequence_b64",
+    "has_sequence",
+
     # SMART_MONEY (12)
     "smart_wallet_buyers_1m",
     "smart_wallet_buyers_5m",
@@ -211,7 +222,7 @@ CSV_COLUMNS: list[str] = [
     "axiom_collected",
     "axiom_cost_usd",
 
-    # LABELS (10)
+    # LABELS (13)
     "did_1_25x",
     "did_1_5x",
     "did_2x",
@@ -222,6 +233,9 @@ CSV_COLUMNS: list[str] = [
     "survived_24h",
     "max_drawdown_pct",
     "inferred_label",
+    "labels_ready",
+    "time_to_peak_minutes",
+    "peak_multiplier",
 ]
 
 # DB column name → CSV column name mapping
@@ -274,6 +288,12 @@ for col in CSV_COLUMNS:
         ONNX_DTYPE_MAP[col] = "int32"
     elif col == "inferred_label":
         ONNX_DTYPE_MAP[col] = "int32"
+    elif col == "labels_ready":
+        ONNX_DTYPE_MAP[col] = "int32"
+    elif col == "has_sequence":
+        ONNX_DTYPE_MAP[col] = "int32"
+    elif col == "sequence_b64":
+        ONNX_DTYPE_MAP[col] = "string"
     else:
         ONNX_DTYPE_MAP[col] = "float32"
 
@@ -352,6 +372,10 @@ def row_to_csv(row: dict[str, Any]) -> dict[str, Any]:
             )):
                 val = 0
             elif csv_col == "inferred_label":
+                val = 0
+            elif csv_col == "labels_ready":
+                val = 0
+            elif csv_col == "has_sequence":
                 val = 0
             else:
                 val = 0.0

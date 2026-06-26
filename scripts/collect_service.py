@@ -43,6 +43,7 @@ from supabase import create_client, Client
 from features import compute_all_features, parse_swaps_for_window
 from quality_validator import QualityValidator, run_quality_check
 from axiom_service import AxiomService, get_axiom_service  # uses Mobula under the hood
+from backfill_labels import backfill_labels
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -609,6 +610,15 @@ def build_record(
     """
     snapshots_raw = scheduler_data.get("snapshots", {})
 
+    # Extract T0 metadata for safety features
+    t0_snap = snapshots_raw.get("t0", {})
+    t0_price = t0_snap.get("price", {})
+    t0_asset = t0_snap.get("asset", {})
+    pair_created_at = t0_price.get("pair_created_at", 0) if isinstance(t0_price, dict) else 0
+    deployer = t0_asset.get("deployer", "") if isinstance(t0_asset, dict) else ""
+    # The full DAS asset response is stored under _das_raw in the snapshot
+    das_asset_full = t0_snap.get("_das_asset", {})
+
     # Build snapshots dict for features.py (price + liquidity per timestamp)
     snapshots: dict[str, dict] = {}
     for window_label in ("t0", "t1m", "t5m", "t15m"):
@@ -634,11 +644,14 @@ def build_record(
     # 24h data for labels (fetched after 15m when we have mature data)
     price_24h = get_price_data_24h(mint)
 
-    # Compute all features
+    # Compute all features (including safety features from DAS data)
     features = compute_all_features(
         snapshots=snapshots,
         swaps_by_window=swaps_by_window,
         price_data_24h=price_24h,
+        t0_asset=das_asset_full,
+        pair_created_at=pair_created_at,
+        graduation_timestamp=t0_ts,
     )
 
     # ---- Axiom: wallet-intelligence features (optional) ----
@@ -663,7 +676,7 @@ def build_record(
         "symbol": scheduler_data.get("symbol", ""),
         "graduation_timestamp": t0_ts,
         "collected_at": datetime.now(timezone.utc).isoformat(),
-        "deployer_address": "",  # populated from DAS if available
+        "deployer_address": deployer,
         **features,
         **axiom_features,
     }
@@ -723,7 +736,7 @@ def collect_t0_snapshot(mint: str, t0_ts: int) -> dict:
     """
     Collect T0 baseline snapshot immediately after migration detection.
     Tries to get DexScreener price (may not exist yet for brand-new pairs)
-    and DAS metadata for symbol.
+    and DAS metadata for symbol + safety features.
     """
     price = get_price_snapshot(mint)
     asset = get_asset(mint)
@@ -747,6 +760,7 @@ def collect_t0_snapshot(mint: str, t0_ts: int) -> dict:
             "symbol": symbol,
             "deployer": deployer,
         },
+        "_das_asset": asset,  # full DAS response for safety feature computation
         "collected_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -822,6 +836,21 @@ def main() -> None:
     )
     keepalive_thread.start()
     time.sleep(0.5)
+
+    # ---- Start label backfill daemon (24h re-check) ----
+    def _backfill_daemon() -> None:
+        """Backfill labels for tokens >24h old every 5 minutes."""
+        while True:
+            try:
+                count = backfill_labels(supabase)
+                if count > 0:
+                    log.info("Backfill: updated %d token labels", count)
+            except Exception:
+                log.exception("Backfill daemon error")
+            time.sleep(300)
+
+    backfill_thread = Thread(target=_backfill_daemon, daemon=True)
+    backfill_thread.start()
 
     # ---- DNS warmup (Render free-tier cold-start mitigations) ----
     _hosts = list(DNS_WARMUP_HOSTS)

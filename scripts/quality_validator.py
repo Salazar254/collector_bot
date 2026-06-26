@@ -53,6 +53,11 @@ NUMERIC_FEATURES: list[str] = [
     # VOLATILITY (4)
     "volatility_1m", "volatility_5m", "volatility_15m",
     "drawdown_first_15m",
+    # SAFETY (7 numeric — excludes sequence_b64 TEXT, has_sequence BOOLEAN)
+    "mint_authority_active", "freeze_authority_active",
+    "mutable_metadata", "lp_burn_pct",
+    "initial_liquidity_sol", "migration_speed_seconds",
+    "avg_transaction_size_sol",
     # SMART_MONEY (12)
     "smart_wallet_buyers_1m", "smart_wallet_buyers_5m", "smart_wallet_buyers_15m",
     "smart_wallet_volume_1m", "smart_wallet_volume_5m", "smart_wallet_volume_15m",
@@ -171,6 +176,11 @@ for f in NUMERIC_FEATURES:
         FEATURE_CATEGORY_MAP[f] = "WHALES"
     elif f.startswith("volatility") or f.startswith("drawdown"):
         FEATURE_CATEGORY_MAP[f] = "VOLATILITY"
+    elif f.startswith("mint_authority") or f.startswith("freeze_authority") or \
+         f.startswith("mutable_") or f.startswith("lp_burn") or \
+         f.startswith("initial_liquidity") or f.startswith("migration_speed") or \
+         f.startswith("avg_transaction_size"):
+        FEATURE_CATEGORY_MAP[f] = "SAFETY"
 
 # ---------------------------------------------------------------------------
 # Thresholds

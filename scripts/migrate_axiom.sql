@@ -155,7 +155,27 @@ ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS axiom_collected            
 ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS axiom_cost_usd                   FLOAT4 DEFAULT 0.0;
 
 -- =======================================================================
--- 18. AXIOM SUPPORT TABLES
+-- 18. SAFETY FEATURES (9 columns, source: Helius DAS + DexScreener)
+-- =======================================================================
+ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS mint_authority_active          FLOAT4;
+ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS freeze_authority_active        FLOAT4;
+ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS mutable_metadata               FLOAT4;
+ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS lp_burn_pct                    FLOAT4;
+ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS initial_liquidity_sol          FLOAT4;
+ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS migration_speed_seconds        FLOAT4;
+ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS avg_transaction_size_sol       FLOAT4;
+ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS sequence_b64                   TEXT;
+ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS has_sequence                   BOOLEAN DEFAULT FALSE;
+
+-- =======================================================================
+-- 19. BACKFILL LABEL COLUMNS (3 columns)
+-- =======================================================================
+ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS labels_ready                    BOOLEAN DEFAULT FALSE;
+ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS time_to_peak_minutes            FLOAT4;
+ALTER TABLE training_tokens ADD COLUMN IF NOT EXISTS peak_multiplier                 FLOAT4;
+
+-- =======================================================================
+-- 20. AXIOM SUPPORT TABLES
 -- =======================================================================
 CREATE TABLE IF NOT EXISTS axiom_raw_responses (
   id BIGSERIAL PRIMARY KEY,

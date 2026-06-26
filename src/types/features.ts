@@ -131,6 +131,22 @@ export interface VolatilityFeatures {
 }
 
 // =========================================================================
+// SAFETY — 9 features, source: Helius DAS + DexScreener + computed
+// =========================================================================
+
+export interface SafetyFeatures {
+  mint_authority_active: number;     // float32 — 1 if mint authority not revoked
+  freeze_authority_active: number;   // float32 — 1 if freeze authority not revoked
+  mutable_metadata: number;          // float32 — 1 if token metadata is mutable
+  lp_burn_pct: number;               // float32 — percentage of LP tokens burned (0-100)
+  initial_liquidity_sol: number;     // float32 — SOL in LP pool at T0
+  migration_speed_seconds: number;   // float32 — graduation_ts - pair_created_at
+  avg_transaction_size_sol: number;  // float32 — average SOL per swap in 15m window
+  sequence_b64: string;              // base64-encoded numpy compressed time series
+  has_sequence: boolean;             // true if at least 2 price points exist
+}
+
+// =========================================================================
 // All token features composed
 // =========================================================================
 
@@ -142,7 +158,8 @@ export interface TokenFeatures
     SellerFeatures,
     OrderFlowFeatures,
     WhaleFeatures,
-    VolatilityFeatures {}
+    VolatilityFeatures,
+    SafetyFeatures {}
 
 // =========================================================================
 // Labels (profit-tier targets from DexScreener 24h price change)
@@ -159,6 +176,9 @@ export interface TokenLabels {
   survived_24h: number;          // int32 — 1 if liquidity ≥ $10 AND pair still alive after 24h
   max_drawdown_pct: number;      // float32 — worst observed drawdown
   inferred_label: number;        // int32 — 1 if labels were computed (vs fallback 0)
+  labels_ready: boolean;         // true after backfill completes
+  time_to_peak_minutes: number | null;  // float32 — minutes from T0 to peak (best-effort)
+  peak_multiplier: number;       // float32 — peak_price / entry_price (best-effort)
 }
 
 // =========================================================================

@@ -89,6 +89,19 @@ CREATE TABLE IF NOT EXISTS training_tokens (
   drawdown_first_15m     FLOAT4,   -- max(0, (max_price - min_price) / max_price) * 100
 
   -- =======================================================================
+  -- SAFETY (9 features, source: Helius DAS + DexScreener + computed)
+  -- =======================================================================
+  mint_authority_active   FLOAT4,   -- 1 if mint authority not revoked
+  freeze_authority_active FLOAT4,   -- 1 if freeze authority not revoked
+  mutable_metadata        FLOAT4,   -- 1 if token metadata is mutable
+  lp_burn_pct             FLOAT4,   -- percentage of LP tokens burned (0-100)
+  initial_liquidity_sol   FLOAT4,   -- SOL in LP pool at T0 (from DexScreener)
+  migration_speed_seconds FLOAT4,   -- graduation_ts - pair_created_at
+  avg_transaction_size_sol FLOAT4,  -- average SOL per swap in 15m window
+  sequence_b64            TEXT,     -- base64-encoded numpy compressed price+volume series
+  has_sequence            BOOLEAN DEFAULT FALSE,
+
+  -- =======================================================================
   -- SMART MONEY (12 features, source: Axiom)
   -- =======================================================================
   smart_wallet_buyers_1m            INT4,
@@ -242,6 +255,9 @@ CREATE TABLE IF NOT EXISTS training_tokens (
   survived_24h           SMALLINT DEFAULT 0,   -- liquidity >= $10 AND pair still alive after 24h
   max_drawdown_pct       FLOAT4,               -- worst observed drawdown
   inferred_label         BOOLEAN DEFAULT FALSE, -- true if labels were computed
+  labels_ready            BOOLEAN DEFAULT FALSE, -- TRUE after backfill completes
+  time_to_peak_minutes    FLOAT4,               -- minutes from T0 to peak price (best-effort)
+  peak_multiplier         FLOAT4,               -- peak_price / entry_price (best-effort)
 
   -- =======================================================================
   -- METADATA
